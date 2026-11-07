@@ -67,8 +67,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File icon-src\build-icons.ps1
 
 ## 目录约定
 
-程序把日志和"最近一次访问地址"写在 exe 所在目录：
+部署目录（`D:\agents\dsh`）**只有 `dsh-web.exe` 一个文件**，没有配套脚本。
+程序把日志和"最近一次访问地址"写在 exe 旁边：
 
 - `logs\dsh-web.out.log` / `.err.log` — node 的 stdout / stderr
 - `last-url.txt` — 最近一次启动拿到的带 token 地址
 - `headless.log` — 命令行模式的关键输出（控制台不可用时的兜底）
+
+这些都是运行期自动生成的，删掉会重建。程序按 **exe 所在目录**定位它们，
+所以整个目录可以整体搬到别处。
+

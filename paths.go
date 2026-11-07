@@ -23,28 +23,46 @@ var Paths = pathsT{}
 
 // Root 定位安装目录。
 //
-// 优先用 exe 所在目录，但必须能在那儿看到 dsh-web-restart.ps1 或 last-url.txt，
-// 否则退回 D:\agents\dsh —— 防止把 exe 挪到临时目录后日志/地址文件散落。
+// 现在的规则：**以 exe 自己所在目录为准**，不再靠"旁边有没有某个文件"来认。
+//
+// 历史原因：早先靠 dsh-web-restart.ps1 / last-url.txt 是否存在来判定，
+// 但这两个文件后来都被删了（脚本改成备用入口又整体移除，地址文件是运行产物），
+// 判定就永远失效、只能吃 D:\agents\dsh 这个写死的兜底 —— 等于把目录
+// 绑死在固定路径上，挪个位置日志就写错地方。
+//
+// 唯一保留的兜底：exe 所在目录不可写时（比如放在 Program Files）才退到
+// D:\agents\dsh，避免日志静默写失败。
 func (pathsT) Root() string {
 	exe, err := os.Executable()
-	if err != nil {
-		exe = ""
+	if err != nil || exe == "" {
+		if wd, e := os.Getwd(); e == nil {
+			return wd
+		}
+		return "."
 	}
 	dir := filepath.Dir(exe)
-	if exe == "" {
-		if wd, e := os.Getwd(); e == nil {
-			dir = wd
-		}
-	}
-	if fileExists(filepath.Join(dir, "dsh-web-restart.ps1")) ||
-		fileExists(filepath.Join(dir, "last-url.txt")) {
+	if dirWritable(dir) {
 		return dir
 	}
+
 	const fallback = `D:\agents\dsh`
-	if st, e := os.Stat(fallback); e == nil && st.IsDir() {
+	if st, e := os.Stat(fallback); e == nil && st.IsDir() && dirWritable(fallback) {
 		return fallback
 	}
 	return dir
+}
+
+// dirWritable 探测目录是否可写。
+// 不真的建日志文件，只试建一个临时名再删掉，避免副作用。
+func dirWritable(dir string) bool {
+	f, err := os.CreateTemp(dir, ".dsh-wtest-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	f.Close()
+	_ = os.Remove(name)
+	return true
 }
 
 func (p pathsT) LogDir() string  { return filepath.Join(p.Root(), "logs") }

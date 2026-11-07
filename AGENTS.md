@@ -187,8 +187,15 @@ gofmt → windres 生成 `app.syso` → `go vet`（必须 0 告警）→ `go bui
 ## 部署
 
 发布产物放 `D:\agents\dsh\dsh-web.exe`。
-同目录的 `dsh-web-restart.cmd` / `dsh-web-restart.ps1` 是**备用入口**，
-用户明确要求保留，不要删。
+
+**部署目录现在只有 exe**（外加运行期自动生成的 `logs\` 和 `headless.log`）。
+早期的 `dsh-web-restart.cmd` / `dsh-web-restart.ps1` / `dsh-web-stop.cmd`
+和 `dsh web.lnk` 快捷方式**已被用户明确要求删除**，不要再往那儿加备用入口。
+`icons\` 也已删除（原先只是给快捷方式提供图标）。
+
+`Paths.Root()` 因此不再靠"旁边有没有某个标记文件"来定位安装目录，
+改为**以 exe 所在目录为准**，只在目录不可写时退到 `D:\agents\dsh`。
+别再把这个判定改回依赖具体文件名 —— 那些文件都已经不存在了。
 
 ## 图标
 
