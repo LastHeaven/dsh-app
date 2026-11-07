@@ -1,0 +1,7 @@
+// 资源脚本：把清单和主图标链进 exe。
+//
+// syso 由 build.ps1 调 windres 生成（windres 在 msys64/ucrt64/bin）。
+// 注意 1 是 RT_MANIFEST 的资源 id：必须用 1（CREATEPROCESS_MANIFEST_RESOURCE_ID），
+// 用别的 id 系统不会当清单读，requireAdministrator 就不会生效。
+1 24 "app.manifest"
+1 ICON "app.ico"

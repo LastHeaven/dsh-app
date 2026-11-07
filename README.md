@@ -2,12 +2,13 @@
 
 `dsh web` 的 Windows 桌面外壳：常驻托盘显示服务状态，双击即可拉起管理界面。
 
-原本是一批零散的脚本（`dsh-web-restart.cmd` → `dsh-web-restart.ps1`），
-现在封装成一个自包含的单文件 exe，不再依赖 PowerShell 转发，也不再弹黑窗口。
+最早是一批零散的脚本（`dsh-web-restart.cmd` → `dsh-web-restart.ps1`），
+中间曾封装成 C# 单文件 exe（63.77 MB），**现在是 Go 写的原生 Win32 程序，2.99 MB**，
+不依赖 .NET 运行时，也不依赖任何第三方 Go 模块。
 
 ## 行为
 
-**托盘图标**（右下角通知区，透明底鲸鱼 —— 形状取自 dsh 的 `icon.svg`）
+**托盘图标**（右下角通知区，鲸鱼形状取自 dsh 的 `icon.svg`）：
 
 | 图标 | 含义 |
 | --- | --- |
@@ -18,7 +19,7 @@
 左键点击 = 打开管理界面。右键菜单：打开管理界面 / 启动 / 停止 / 重启 /
 打开访问地址 / 打开安装目录 / 查看日志 / 退出。
 
-**命令行**（跑完即退，不显示托盘，供脚本和计划任务调用）
+**命令行**（跑完即退，不显示托盘，供脚本和计划任务调用）：
 
 ```
 dsh-web.exe                 启动并显示托盘
@@ -31,50 +32,43 @@ dsh-web.exe -Headless       不显示托盘，按命令行跑完就退出
 dsh-web.exe -Help           帮助
 ```
 
+`-Stop` 只影响**指定端口**上的那个实例。不带 `--port` 启动的实例默认是 3080，
+所以 `-Stop -Port 3199` 永远不会碰到 3080。详见 [AGENTS.md](AGENTS.md) 第 1 条。
+
 ## 构建
 
-需要 .NET 8 SDK。
+需要 Go 1.24+，以及 `windres`（`C:\msys64\ucrt64\bin\windres.exe`，用来把
+manifest 和图标链进 exe）。
 
 ```powershell
-# 单文件、自包含（目标机器无需安装 .NET 运行时）
-dotnet publish -c Release -r win-x64 --self-contained true `
-  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
-  -p:EnableCompressionInSingleFile=true -o publish
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-产物 `publish\dsh-web.exe` 约 64 MB。
+产物 `publish\dsh-web.exe`，约 3.0 MB。
+
+脚本流程：gofmt → windres 生成 `app.syso` → `go vet` → `go build -ldflags "-s -w -H windowsgui"`
+→ 校验 manifest 是否嵌入（决定 UAC 提权是否生效）。
+
+> 不要把 `-s -w` 去掉，也别关掉 `-H windowsgui`：前者体积会翻几倍，
+> 后者会让每次启动弹一个控制台窗口。
+
+## UAC
+
+`app.manifest` 声明了 `requireAdministrator`：结束旧进程、后台拉起 node
+都需要管理员权限，所以双击时会正常弹 UAC。这是刻意设计，不是 bug。
 
 ## 图标
 
 `assets\*.ico` 和 `app.ico` 是生成物，由 `icon-src\build-icons.ps1` 产出：
 
 ```powershell
-pwsh -File icon-src\build-icons.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File icon-src\build-icons.ps1
 ```
 
-依赖 Chrome（渲染 SVG）和 Python + Pillow（打包 ICO）。
-鲸鱼路径来自 `icon-src\svg\whale.svg`（即原 `icon.svg` 的 `d` 属性）。
+## 目录约定
 
-## 目录
+程序把日志和"最近一次访问地址"写在 exe 所在目录：
 
-| 路径 | 说明 |
-| --- | --- |
-| `Program.cs` | 全部逻辑：托盘、进程探测、启停、单实例 |
-| `dshweb.csproj` | 项目定义与版本信息 |
-| `app.manifest` | 要求管理员权限、长路径支持 |
-| `app.ico` | exe 自身图标 |
-| `assets\` | 托盘三态图标 |
-| `icon-src\` | 图标生成脚本与 SVG 源 |
-
-## 部署位置
-
-目前发布到 `D:\agents\dsh\`，与 `dsh-web-restart.cmd` / `.ps1` 并存。
-那两个脚本作为 exe 不可用时的备用入口**保留未动**。
-
-## 注意
-
-- 程序需要管理员权限（清单里 `requireAdministrator`），因为要结束旧进程、
-  在后台拉起 node。双击会弹 UAC，属正常行为。
-- 浏览器由 `explorer.exe` 代开，以保持普通用户权限 —— 提权进程直接
-  `Start-Process` 会让浏览器也变成管理员身份。
-- 日志在 exe 同级的 `logs\` 下，最近的带 token 地址写在 `last-url.txt`。
+- `logs\dsh-web.out.log` / `.err.log` — node 的 stdout / stderr
+- `last-url.txt` — 最近一次启动拿到的带 token 地址
+- `headless.log` — 命令行模式的关键输出（控制台不可用时的兜底）
