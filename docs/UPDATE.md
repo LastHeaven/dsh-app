@@ -261,7 +261,7 @@ SemVer 比较是自己实现的（[semver.go](../semver.go)），因为当前版
 
 - 后台检查每 6 小时一次，启动后延迟 90 秒（避免和管理界面首屏抢带宽）
 - 检查结果通过 `postMessage(wmUpdateReady)` 交回窗口线程；
-  **`wndProc` 里绝不联网**（见 [PITFALLS](PITFALLS.md#win32-窗口有线程亲和性)）
+  **`wndProc` 里绝不联网**（见 [ARCHITECTURE 线程模型](ARCHITECTURE.md#线程模型)）
 - 同一个版本只弹一次气泡，按版本号去重，不重复骚扰
 - 升级中菜单两项置灰，托盘图标切 busy 态
 - 升级在 goroutine 里跑，`exit()` 会 close `updateStop` 收掉检查循环

@@ -1,7 +1,11 @@
-// 资源脚本：把清单和主图标链进 exe。
+// 资源脚本：把清单、主图标、版本信息链进 exe。
 //
 // syso 由 build.ps1 调 windres 生成（windres 在 msys64/ucrt64/bin）。
 // 注意 1 是 RT_MANIFEST 的资源 id：必须用 1（CREATEPROCESS_MANIFEST_RESOURCE_ID），
 // 用别的 id 系统不会当清单读，requireAdministrator 就不会生效。
 1 24 "app.manifest"
 1 ICON "app.ico"
+
+// 版本信息资源单独放一个文件（windres 的 VERSIONINFO 语法比较挑，
+// 单独放便于改版本号）。没有它 exe 属性里看不到版本号。
+#include "app.version.rc"

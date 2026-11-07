@@ -6,10 +6,30 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-产物 `publish\dsh-web.exe`，约 **3.0 MB**。
+产物 `publish\dsh-web.exe`，约 **3.1 MB**。
 
 脚本流程：gofmt → windres 生成 `app.syso` → `go vet`（必须 0 告警）→
-`go build -ldflags "-s -w -H windowsgui"` → 校验 manifest 是否嵌入。
+`go build -ldflags "-s -w -H windowsgui"` → 校验 manifest 和版本信息是否嵌入。
+
+## 发版
+
+版本号写在 **`app.version.rc`**（`VER_FILEVERSION` / `VER_PRODUCTVERSION`
+以及对应的字符串），改完必须重新跑 `build.ps1` 才会链进 exe。
+`build.ps1` 结尾会自动校验并打印 `[ok] 版本信息：x.y.z`。
+
+打 tag 并发 Release：
+
+```powershell
+git tag -a v1.0.0 -m "1.0.0"
+git push origin v1.0.0
+```
+
+Release 附件传 `publish\dsh-web.exe`。注意仓库里**不提交 exe**
+（`.gitignore` 排除了 `*.exe`），二进制只走 Releases。
+
+> 改 `app.version.rc` 时留意：windres 的 VERSIONINFO 语法挑剔 ——
+> 不支持 `\u` 转义（字符串只能用 ASCII），`VarFileInfo` 里只接受
+> **一条** `Translation`，多写一条会报 `syntax error`。
 
 依赖：
 

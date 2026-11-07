@@ -82,3 +82,11 @@ if ($text.Contains("requireAdministrator")) {
 } else {
     Write-Warning "  [!!] manifest 未嵌入 —— UAC 提权不会生效"
 }
+
+# 校验：版本信息资源
+$ver = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
+if ($ver) {
+    Write-Host "  [ok] 版本信息：$ver" -ForegroundColor Green
+} else {
+    Write-Warning "  [!!] 缺少版本信息资源（app.version.rc）"
+}

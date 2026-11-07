@@ -3,8 +3,26 @@
 `dsh web` 的 Windows 桌面外壳：常驻托盘显示服务状态，双击即可拉起管理界面。
 
 最早是一批零散的脚本（`dsh-web-restart.cmd` → `dsh-web-restart.ps1`），
-中间曾封装成 C# 单文件 exe（63.77 MB），**现在是 Go 写的原生 Win32 程序，2.99 MB**，
+中间曾封装成 C# 单文件 exe（63.77 MB），**现在是 Go 写的原生 Win32 程序，3.07 MB**，
 不依赖 .NET 运行时，也不依赖任何第三方 Go 模块。
+
+当前版本 **1.0.0**，可在 [Releases](https://github.com/LastHeaven/dsh-app/releases) 下载 `dsh-web.exe`。
+
+## 使用前需要
+
+exe 本身是自包含的（纯静态编译，只依赖 Windows 自带的系统 DLL），
+但它管理的是 dsh 服务，所以目标机器需要先装好：
+
+| 依赖 | 要求 |
+| --- | --- |
+| Windows | 64 位，Win7 及以上 |
+| **Node.js** | ≥ 24.9.0（dsh 的 `engines.node` 要求） |
+| **dsh** | `npm i -g @deepseek-ai/dsh` |
+| 权限 | 需要管理员（双击会弹 UAC，这是刻意设计） |
+
+缺 Node.js 或 dsh 时会给出中文提示，不会闪退。
+exe 放在哪个目录都行（日志写在它旁边），但**别放 `C:\Program Files\` 下面**，
+那里写日志会被拒。
 
 ## 行为
 
@@ -54,7 +72,7 @@ manifest 和图标链进 exe）。
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-产物 `publish\dsh-web.exe`，约 3.0 MB。
+产物 `publish\dsh-web.exe`，约 3.1 MB，带版本信息（右键属性可见）。
 
 脚本流程：gofmt → windres 生成 `app.syso` → `go vet` → `go build -ldflags "-s -w -H windowsgui"`
 → 校验 manifest 是否嵌入（决定 UAC 提权是否生效）。

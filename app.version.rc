@@ -1,0 +1,60 @@
+// PE 版本信息资源（VS_VERSION_INFO）。
+//
+// 没有这个，exe 右键「属性 → 详细信息」里版本号是空的。发正式版必须带上。
+//
+// 版本号改这里，同时同步下面对应的字符串值 —— 两处不一致会让人困惑。
+// build.ps1 会把它链进 exe（windres 支持 .rc 里 include 另一个 .rc 片段）。
+
+#define VER_FILEVERSION             1,0,0,0
+#define VER_FILEVERSION_STR         "1.0.0.0"
+
+#define VER_PRODUCTVERSION          1,0,0,0
+#define VER_PRODUCTVERSION_STR      "1.0.0"
+
+1 VERSIONINFO
+FILEVERSION     VER_FILEVERSION
+PRODUCTVERSION  VER_PRODUCTVERSION
+FILEFLAGSMASK   0x3fL
+#ifdef _DEBUG
+FILEFLAGS       0x1L
+#else
+FILEFLAGS       0x0L
+#endif
+FILEOS          0x40004L
+FILETYPE        0x1L
+FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0804 = 简体中文，04B0 = Unicode
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "FileDescription",  "dsh web tray launcher"
+            VALUE "FileVersion",      VER_FILEVERSION_STR
+            VALUE "InternalName",     "dsh-web"
+            VALUE "OriginalFilename", "dsh-web.exe"
+            VALUE "ProductName",      "dsh web"
+            VALUE "ProductVersion",   VER_PRODUCTVERSION_STR
+            VALUE "LegalCopyright",   "MIT License"
+            VALUE "Comments",         "Windows tray shell for dsh web"
+        END
+        // 0409 = 英文（美国），给非中文系统用
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription",  "dsh web tray launcher"
+            VALUE "FileVersion",      VER_FILEVERSION_STR
+            VALUE "InternalName",     "dsh-web"
+            VALUE "OriginalFilename", "dsh-web.exe"
+            VALUE "ProductName",      "dsh web"
+            VALUE "ProductVersion",   VER_PRODUCTVERSION_STR
+            VALUE "LegalCopyright",   "MIT License"
+            VALUE "Comments",         "Windows tray shell for dsh web"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        // windres 只接受一条 Translation，多条会报 syntax error。
+        // 0x409/1200 = 英文(美国)/Unicode。
+        VALUE "Translation", 0x409, 1200
+    END
+END
