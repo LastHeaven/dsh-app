@@ -33,7 +33,8 @@ dsh-web.exe -Help           帮助
 ```
 
 `-Stop` 只影响**指定端口**上的那个实例。不带 `--port` 启动的实例默认是 3080，
-所以 `-Stop -Port 3199` 永远不会碰到 3080。详见 [AGENTS.md](AGENTS.md) 第 1 条。
+所以 `-Stop -Port 3199` 永远不会碰到 3080。详见
+[docs/PITFALLS.md](docs/PITFALLS.md#-stop-的判定必须按命令行---port不能猜)。
 
 ## 构建
 

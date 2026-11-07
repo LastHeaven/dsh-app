@@ -16,3 +16,7 @@ last-url.txt
 
 # 图标渲染中间产物（Chrome 临时目录，别提交）
 icon-src/.work/
+
+# Python 缓存
+__pycache__/
+*.pyc

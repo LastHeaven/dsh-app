@@ -390,7 +390,7 @@ func (t *TrayApp) openUIAsync() {
 // node 还在后台跑，下次启动还会撞端口占用。
 //
 // 停的仍然是 Stop(t.opt.Port) —— 只停命令行里 --port 等于本端口的那一个，
-// 绝不波及别的端口上的实例（改这里之前先读 AGENTS.md 第 1 条）。
+// 绝不波及别的端口上的实例（改这里之前先读 docs/PITFALLS.md 的「进程与端口」）。
 //
 // 注意这一段是**同步**跑的，Stop 里最多会等 20 秒等进程退出。
 // dispatchCommand 用 goroutine 调本函数，所以不会卡住消息循环；
