@@ -74,6 +74,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 
 产物 `publish\dsh-web.exe`，约 3.1 MB，带版本信息（右键属性可见）。
 
+发版走 GitHub Actions：打 tag 即自动构建、测试、发布 Release。
+
+```powershell
+git tag -a v1.0.1 -m "1.0.1"
+git push origin v1.0.1
+```
+
+详见 [docs/TESTING.md](docs/TESTING.md#发版)。
+
 脚本流程：gofmt → windres 生成 `app.syso` → `go vet` → `go build -ldflags "-s -w -H windowsgui"`
 → 校验 manifest 是否嵌入（决定 UAC 提权是否生效）。
 

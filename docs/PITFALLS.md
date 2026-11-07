@@ -316,6 +316,38 @@ Windows PowerShell 5.1 按 GBK 解析无 BOM 的 `.ps1`，中文会乱码并导�
 错乱、语法报错。`build.ps1` 和 `icon-src/build-icons.ps1` 都是带 BOM 的。
 改完 `.ps1` 要确认前三个字节是 `EF BB BF`。
 
+**这个坑踩过三次以上，全都是用编辑工具改完 `.ps1` 之后 BOM 被吃掉。**
+典型症状是改完明明看着没问题，一跑就：
+
+```
+The string is missing the terminator: ".
+Missing closing '}' in statement block or type definition.
+```
+
+改完 `.ps1` 务必确认：
+
+```powershell
+$b=[IO.File]::ReadAllBytes('build.ps1'); ($b[0..2]|%{$_.ToString('X2')}) -join ' '
+# 必须输出 EF BB BF
+```
+
+掉了就补：
+
+```powershell
+$p='build.ps1'
+$t=[IO.File]::ReadAllText($p,(New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText($p,$t,(New-Object Text.UTF8Encoding($true)))
+```
+
+### windres 不接受字符串型 `-D` 覆盖
+
+想用 `-DVER_PRODUCTVERSION_STR="1.2.3"` 在编译期换版本号 —— 不行。
+字符串型 `-D` 需要内层引号，而各 shell 的转义规则不一致，PowerShell 下
+实测直接 `app.version.rc:46: syntax error`。
+
+**正确做法**：让脚本改写 `app.version.rc` 文件本身（`build.ps1 -SetVersion`），
+改文件比拼命令行可靠得多。
+
 ### 别用 PowerShell 的 `Set-Content` 改 `.go` 文件
 
 它会把文件写成带 BOM 或 GBK，Go 编译器直接报 `illegal UTF-8 encoding`。

@@ -2,8 +2,12 @@
 //
 // 没有这个，exe 右键「属性 → 详细信息」里版本号是空的。发正式版必须带上。
 //
-// 版本号改这里，同时同步下面对应的字符串值 —— 两处不一致会让人困惑。
-// build.ps1 会把它链进 exe（windres 支持 .rc 里 include 另一个 .rc 片段）。
+// 版本号就在这里改（两处要一致：FILEVERSION 是 4 段数字，PRODUCTVERSION_STR 是显示串）。
+// CI 发版时 build.ps1 会用 -SetVersion 参数把这个文件里的值改成 tag 版本，
+// 所以不需要手工同步 —— 但本地直接改这里也有效。
+//
+// 为什么不给 windres 传 -D 覆盖：字符串型的 -D 要带内层引号，
+// 在各种 shell 里的转义规则不一致，实测 PowerShell 下会变成 syntax error。改写文件更可靠。
 
 #define VER_FILEVERSION             1,0,0,0
 #define VER_FILEVERSION_STR         "1.0.0.0"

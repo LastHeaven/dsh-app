@@ -1,0 +1,225 @@
+name: Release
+
+# 打 tag 即发版：v1.2.3 → 自动构建、跑测试、发布 Release 并附上 exe。
+#
+# 为什么用 windows-latest 而不是 ubuntu：
+#   exe 需要把 manifest（requireAdministrator）、图标、版本资源链进去，
+#   这靠 windres 生成 app.syso。Linux runner 上的 minGW windres 行为与本机
+#   msys64 不完全一致，而且 build.ps1 是 PowerShell 5.1 脚本（依赖 UTF-8 BOM
+#   才能正确解析中文）。直接用 Windows runner 跑同一份 build.ps1，
+#   本地能出什么、CI 就出什么，不引入第二套工具链。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 手动触发，用于验证流水线本身（不会发布 Release）
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只构建，不发布 Release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # 建 Release、传附件需要
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 准备 windres
+        shell: pwsh
+        run: |
+          # windows-latest 预装了 MSYS2（C:\msys64，不在 PATH 里），
+          # 但 ucrt64/mingw64 里的 windres 不一定有 —— 那属于 mingw 工具链包。
+          # 所以先挨个探，找不到再用 pacman 装。
+          $candidates = @(
+            "C:\msys64\ucrt64\bin\windres.exe",
+            "C:\msys64\mingw64\bin\windres.exe"
+          )
+          $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $found) {
+            Write-Host "预装 MSYS2 里没有 windres，用 pacman 安装 mingw-w64-ucrt-x86_64-binutils"
+            $bash = 'C:\msys64\usr\bin\bash.exe'
+            if (-not (Test-Path $bash)) { throw "找不到 MSYS2（$bash）" }
+            # pacman -S --noconfirm，装完 windres 就在 ucrt64/bin 下
+            & $bash -lc "pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-binutils"
+            if ($LASTEXITCODE -ne 0) { throw "pacman 安装 binutils 失败（退出码 $LASTEXITCODE）" }
+            $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+
+          if (-not $found) { throw "windres 仍然找不到 —— 没有它 exe 会缺 manifest，拒绝继续" }
+
+          Write-Host "windres: $found"
+          & $found --version | Select-Object -First 1
+          "windres_path=$found" >> $env:GITHUB_ENV
+
+      - name: 解析版本号
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $v = $env:GITHUB_REF -replace '^refs/tags/v', ''
+            $isTag = 'true'
+          } else {
+            # 手动触发：用当前 rc 文件里的版本，仅验证流程
+            $rc = [IO.File]::ReadAllText('app.version.rc', [Text.Encoding]::UTF8)
+            $m = [regex]::Match($rc, '(?m)^#define VER_PRODUCTVERSION_STR\s+"([^"]+)"')
+            $v = $m.Groups[1].Value
+            $isTag = 'false'
+            Write-Host "非 tag 触发，使用 rc 里的版本：$v"
+          }
+          # 允许 x.y.z（正式版）和 x.y.z-suffix（预发布），后者在 Release 上标记为 prerelease
+          if ($v -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            throw "版本号格式不对：$v（要求 x.y.z 或 x.y.z-suffix，不带 v 前缀）"
+          }
+          # app.version.rc 的 4 段数字版本只取前三段
+          $numeric = ($v -replace '-.*$', '')
+          Write-Host "版本：$v（数字段 $numeric）"
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "numeric=$numeric" >> $env:GITHUB_OUTPUT
+          "is_tag=$isTag" >> $env:GITHUB_OUTPUT
+          "prerelease=$($v.Contains('-'))" >> $env:GITHUB_OUTPUT
+
+      - name: 构建
+        shell: pwsh
+        run: |
+          # 用数字段（x.y.z）传给 build.ps1，预发布的 -rc.1 后缀不进 PE 版本资源
+          ./build.ps1 -SetVersion ${{ steps.ver.outputs.numeric }}
+          if ($LASTEXITCODE -ne 0) { throw "构建失败" }
+
+      - name: 单元测试
+        shell: pwsh
+        run: |
+          go test ./... -v
+          if ($LASTEXITCODE -ne 0) { throw "测试未通过" }
+
+      - name: 校验产物（manifest + 版本 + 大小）
+        shell: pwsh
+        run: |
+          $exe = 'publish\dsh-web.exe'
+          if (-not (Test-Path $exe)) { throw "没有产物" }
+
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $text  = [Text.Encoding]::ASCII.GetString($bytes)
+          if (-not $text.Contains('requireAdministrator')) {
+            throw "manifest 未嵌入 —— UAC 提权不会生效，拒绝发布"
+          }
+
+          $vi = (Get-Item $exe).VersionInfo
+          $want = '${{ steps.ver.outputs.numeric }}'
+          if ($vi.ProductVersion -ne $want) {
+            throw "版本不对：期望 $want，实际 $($vi.ProductVersion)"
+          }
+
+          $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+          if ($sizeMB -gt 6) { throw "体积异常：$sizeMB MB（预期约 3 MB）" }
+
+          Write-Host "  manifest: ok"
+          Write-Host "  version : $($vi.ProductVersion)"
+          Write-Host "  size    : $sizeMB MB"
+
+      - name: 生成发布用文件名与校验值
+        id: pkg
+        shell: pwsh
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $name = "dsh-web-$v-win64.exe"
+          Copy-Item 'publish\dsh-web.exe' "publish\$name" -Force
+          $sha = (Get-FileHash "publish\$name" -Algorithm SHA256).Hash
+          $size = (Get-Item "publish\$name").Length
+          Write-Host "$name  $size 字节  SHA256=$sha"
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          "size=$size" >> $env:GITHUB_OUTPUT
+
+      - name: 上传构建产物（供手动下载/排查）
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-web-${{ steps.ver.outputs.version }}
+          path: publish/${{ steps.pkg.outputs.name }}
+          retention-days: 14
+
+      - name: 发布 Release
+        # 只在打 tag 时发布；手动触发（workflow_dispatch）永远不发布，
+        # 用来验证流水线本身。用 steps.ver.outputs.is_tag 判断，不依赖
+        # github.event.inputs —— 后者在 push 触发时不存在，写成 != 'true'
+        # 会让 push 场景判断失真。
+        if: steps.ver.outputs.is_tag == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: dsh web 托盘版 ${{ steps.ver.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          files: publish/${{ steps.pkg.outputs.name }}
+          draft: false
+          prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
+          generate_release_notes: false
+          body: |
+            ## dsh web 托盘版 ${{ steps.ver.outputs.version }}
+
+            `dsh web` 的 Windows 托盘外壳。常驻通知区显示服务状态，左键打开管理界面，右键启停。
+
+            **单文件，纯静态编译，零第三方依赖**（不依赖 .NET 运行时，也不依赖任何第三方 Go 模块）。
+
+            ### 使用前提
+
+            本程序是 dsh 的外壳，不是 dsh 本身。目标机器需要先装好：
+
+            | 依赖 | 要求 |
+            | --- | --- |
+            | Windows | 64 位，Win7 及以上 |
+            | Node.js | >= 24.9.0 |
+            | dsh | `npm i -g @deepseek-ai/dsh` |
+            | 权限 | 管理员（双击会弹 UAC，这是刻意设计：结束旧进程和后台拉起 node 都需要） |
+
+            缺 Node.js 或 dsh 时会给出中文提示，不会闪退。exe 放哪个目录都行（日志写在它旁边），
+            但别放 `C:\Program Files\` 下面。
+
+            ### 功能
+
+            - **托盘三态**：黑色鲸鱼 = 运行中 / 琥珀 = 启动中 / 灰色 = 未运行（只看端口是否 LISTEN）
+            - **自动更新**：每 6 小时后台检查，发现新版弹气泡提示，右键一键升级。
+              两阶段升级 —— 阶段 A 在服务照常运行时下载（用户无感），
+              阶段 B 停服后只用同盘 rename 切换目录（数秒）。失败自动回滚到旧版。
+            - **`-Stop` 严格按命令行 `--port` 匹配**，绝不误伤其它端口上的实例
+
+            ### 命令行
+
+            ```
+            dsh-web.exe                 启动并显示托盘
+            dsh-web.exe -Port 8080      指定端口
+            dsh-web.exe -Stop           只关闭该端口上的实例
+            dsh-web.exe -DryRun         只检测并输出
+            dsh-web.exe -Headless       不显示托盘，跑完即退
+            dsh-web.exe -CheckUpdate    查一次新版本就退出
+            dsh-web.exe -Update         升级到最新版
+            dsh-web.exe -UpdateTo 1.2.3 升级到指定版本
+            dsh-web.exe -NoUpdateCheck  关闭后台更新检查
+            dsh-web.exe -Help           帮助
+            ```
+
+            ### 许可
+
+            [MIT License](https://github.com/${{ github.repository }}/blob/main/LICENSE)
+
+            ### 校验
+
+            ```
+            ${{ steps.pkg.outputs.name }}
+            ${{ steps.pkg.outputs.size }} 字节
+            SHA256: ${{ steps.pkg.outputs.sha256 }}
+            ```

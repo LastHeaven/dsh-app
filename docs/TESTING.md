@@ -13,15 +13,48 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 
 ## 发版
 
-版本号写在 **`app.version.rc`**（`VER_FILEVERSION` / `VER_PRODUCTVERSION`
-以及对应的字符串），改完必须重新跑 `build.ps1` 才会链进 exe。
-`build.ps1` 结尾会自动校验并打印 `[ok] 版本信息：x.y.z`。
+### 自动（推荐）
 
-打 tag 并发 Release：
+打 tag 就行，GitHub Actions 会自动构建、跑测试、发布 Release：
 
 ```powershell
-git tag -a v1.0.0 -m "1.0.0"
-git push origin v1.0.0
+git tag -a v1.0.1 -m "1.0.1"
+git push origin v1.0.1
+```
+
+流水线（[.github/workflows/release.yml](../.github/workflows/release.yml)）做的事：
+
+1. 装 Go + 准备 windres
+2. 用 `build.ps1 -SetVersion <tag版本>` 构建（版本号写进 exe 属性）
+3. `go test ./...`
+4. **校验产物**：manifest 必须嵌入、版本号必须匹配、体积不得超 6 MB，任一不符直接失败
+5. 算 SHA256，传 Release 附件
+
+预发布版（tag 带 `-`，如 `v1.2.3-rc.1`）会自动标成 prerelease。
+
+想只验证流水线本身、不发版：在 Actions 页面手动 **Run workflow**
+（`workflow_dispatch`），它只构建和上传 artifact，不碰 Release。
+
+**为什么用 `windows-latest` 而不是 ubuntu**：exe 需要把 manifest
+（requireAdministrator）、图标、版本资源经 windres 链进去，而 `build.ps1`
+是 PowerShell 脚本（依赖 UTF-8 BOM 解析中文）。用 Windows runner 跑同一份
+脚本，本地能出什么 CI 就出什么，不引入第二套工具链。
+
+### 手动
+
+```powershell
+./build.ps1 -SetVersion 1.0.1
+```
+
+版本号写在 **`app.version.rc`**，`-SetVersion` 会改写它。
+不带参数时用文件里的默认值。`build.ps1` 结尾自动校验并打印
+`[ok] 版本信息：x.y.z`。
+
+打 tag 并发 Release（手动路线）：
+
+```powershell
+git tag -a v1.0.1 -m "1.0.1"
+git push origin v1.0.1
 ```
 
 Release 附件传 `publish\dsh-web.exe`。注意仓库里**不提交 exe**
@@ -30,6 +63,8 @@ Release 附件传 `publish\dsh-web.exe`。注意仓库里**不提交 exe**
 > 改 `app.version.rc` 时留意：windres 的 VERSIONINFO 语法挑剔 ——
 > 不支持 `\u` 转义（字符串只能用 ASCII），`VarFileInfo` 里只接受
 > **一条** `Translation`，多写一条会报 `syntax error`。
+> 也**别用 `-D` 覆盖版本**：字符串型 `-D` 要带内层引号，PowerShell 下
+> 转义不一致，实测直接 syntax error。改文件更稳。
 
 依赖：
 

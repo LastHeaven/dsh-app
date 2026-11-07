@@ -9,7 +9,9 @@
 [CmdletBinding()]
 param(
     [string]$OutDir = "publish",
-    [switch]$SkipTest
+    [switch]$SkipTest,
+    # 发版用：把版本号写进 app.version.rc 再编译，例如 -SetVersion 1.2.3
+    [string]$SetVersion = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,8 +24,34 @@ function Assert-Command($name, $hint) {
 }
 Assert-Command go "请安装 Go 1.24+ 并加入 PATH。"
 
-# windres 不在 PATH 里，按已知位置找
-$windres = (Get-Command windres -ErrorAction SilentlyContinue).Source
+# 版本号注入：改写 app.version.rc（不是给 windres 传 -D —— 字符串型 -D 的引号
+# 在各 shell 里转义规则不一致，PowerShell 下实测会 syntax error）。
+if ($SetVersion) {
+    if ($SetVersion -notmatch '^\d+\.\d+\.\d+$') {
+        throw "版本号格式应为 x.y.z，收到：$SetVersion"
+    }
+    $four = "$SetVersion.0"
+    $parts = $SetVersion.Split('.')
+    $commas = "$($parts[0]),$($parts[1]),$($parts[2]),0"
+
+    Write-Host "==> 写入版本号 $SetVersion" -ForegroundColor Cyan
+    $rcPath = Join-Path $PSScriptRoot 'app.version.rc'
+    $rc = [System.IO.File]::ReadAllText($rcPath, [System.Text.Encoding]::UTF8)
+    $rc = [regex]::Replace($rc, '(?m)^#define VER_FILEVERSION\s+.*$',
+        "#define VER_FILEVERSION             $commas")
+    $rc = [regex]::Replace($rc, '(?m)^#define VER_FILEVERSION_STR\s+.*$',
+        "#define VER_FILEVERSION_STR         `"$four`"")
+    $rc = [regex]::Replace($rc, '(?m)^#define VER_PRODUCTVERSION\s+.*$',
+        "#define VER_PRODUCTVERSION          $commas")
+    $rc = [regex]::Replace($rc, '(?m)^#define VER_PRODUCTVERSION_STR\s+.*$',
+        "#define VER_PRODUCTVERSION_STR      `"$SetVersion`"")
+    [System.IO.File]::WriteAllText($rcPath, $rc, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# windres 不在 PATH 里，按已知位置找。
+# CI 会先探测/安装，然后把路径放进 $env:windres_path，这里优先用它。
+$windres = $env:windres_path
+if (-not $windres) { $windres = (Get-Command windres -ErrorAction SilentlyContinue).Source }
 if (-not $windres) {
     foreach ($c in @(
             "C:\msys64\ucrt64\bin\windres.exe",
@@ -31,7 +59,7 @@ if (-not $windres) {
         if (Test-Path -LiteralPath $c) { $windres = $c; break }
     }
 }
-if (-not $windres) {
+if (-not $windres -or -not (Test-Path -LiteralPath $windres)) {
     throw "找不到 windres.exe（msys64/ucrt64/bin）。没有它无法嵌入 manifest，exe 会缺少管理员权限声明。"
 }
 
