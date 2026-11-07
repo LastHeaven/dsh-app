@@ -87,6 +87,7 @@ var (
 
 	// shell32
 	procShellNotifyIconW = modshell32.NewProc("Shell_NotifyIconW")
+	procShellExecuteW    = modshell32.NewProc("ShellExecuteW")
 
 	// ntdll：命令行不走 WMI（AOT/原生下 System.Management 不可用，且这里本就没 .NET）
 	procNtQueryInformationProcess = modntdll.NewProc("NtQueryInformationProcess")
@@ -169,6 +170,9 @@ const (
 	lrLoadFromFile = 0x00000010
 	lrDefaultSize  = 0x00000040
 	lrShared       = 0x00008000
+
+	// ShellExecute
+	swShownormal = 1
 
 	// MessageBox
 	mbOK              = 0x00000000
@@ -542,4 +546,25 @@ func destroyIcon(h uintptr) {
 func shellNotifyIcon(action uint32, data *notifyIconData) bool {
 	r, _, _ := procShellNotifyIconW.Call(uintptr(action), uintptr(unsafe.Pointer(data)))
 	return r != 0
+}
+
+// shellExecuteOpen 用系统默认程序打开一个 URL/文件。
+//
+// 这是打开网页的**唯一正确姿势**：由 shell 按协议找到默认浏览器，
+// 而且浏览器不会被本程序的管理员权限带成提权进程（提权的是我们，不是它）。
+//
+// 返回值 > 32 才算成功（ShellExecute 约定；<=32 是错误码）。
+func shellExecuteOpen(target string) bool {
+	verb := utf16Ptr("open")
+	file := utf16Ptr(target)
+	if verb == nil || file == nil {
+		return false
+	}
+	r, _, _ := procShellExecuteW.Call(
+		0, // 无父窗口
+		uintptr(unsafe.Pointer(verb)),
+		uintptr(unsafe.Pointer(file)),
+		0, 0, // 无参数、无工作目录
+		swShownormal) // SW_SHOWNORMAL
+	return r > 32
 }

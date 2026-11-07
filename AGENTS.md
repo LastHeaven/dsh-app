@@ -145,6 +145,33 @@ Windows PowerShell 5.1 按 GBK 解析无 BOM 的 `.ps1`，中文会乱码并导�
 它会把文件写成带 BOM 或 GBK，Go 编译器直接报 `illegal UTF-8 encoding`。
 改代码用编辑器/写入工具，不要用 shell 重定向。
 
+### 13. 打开网页必须用 ShellExecuteW，不能用 exec.Command("explorer.exe", url)
+
+**症状**：托盘启动服务后，会莫名其妙弹出一个「文档 - 文件资源管理器」窗口。
+
+**根因**：`exec.Command("explorer.exe", url)` 不是打开网页的正确姿势。
+Go 的 exec.Command 会按 MS 转义规则把参数拼成命令行，而 `explorer.exe`
+对引号的处理非常特殊：它把带引号的 URL 当成"找不到的路径"，
+于是退化成的默认行为 —— 打开「文档」文件夹。
+
+**实测对比**（同一个带 token 的真实 URL）：
+
+| 方式 | 结果 |
+| --- | --- |
+| `exec.Command("explorer.exe", url)` | 打开「文档」文件夹 |
+| `exec.Command("explorer.exe", url)` + `HideWindow:true` | 没开文件夹（碰巧，不可靠） |
+| `ShellExecuteW("open", url, ...)` | 正常调起浏览器 |
+
+**正确做法**：`shellExecuteOpen()`（`win32.go`），它就是 C# 版
+`UseShellExecute = true` 背后的东西。返回值 `> 32` 才算成功。
+**顺带的好处**：浏览器由 shell 以用户身份启动，不会被本程序的管理员权限
+带成提权进程。
+
+`OpenUrl` 还加了 `http/https` 前缀白名单，防止把奇怪字符串交给 shell。
+
+`OpenFolder`（打开安装目录/日志）**仍然用 explorer.exe** —— 那里是真的要开
+文件夹，语义正确，别一起改掉。
+
 ## 代码结构
 
 | 文件 | 职责 |

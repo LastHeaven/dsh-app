@@ -115,27 +115,53 @@ func (pathsT) IsPortListening(port int) bool {
 	return portOwnerPid(port) > 0
 }
 
-// OpenUrl 用 shell 打开浏览器。
+// OpenUrl 用系统默认浏览器打开地址。
 //
-// 本程序是提权运行的，绝不能直接 CreateProcess 浏览器（会把浏览器也提权）。
-// explorer.exe 由已登录用户会话的 shell 代开，保持普通权限。
+// **不要用 exec.Command("explorer.exe", url)** —— 实测这条会让 explorer
+// 打开「文档」文件夹而不是浏览器。原因：Go 的 exec.Command 会把参数按
+// MS 转义规则拼成命令行，explorer.exe 对引号的处理很特别，带引号的 URL
+// 被它当成"找不到的路径"，于是退化成打开默认文件夹。
+// （加 HideWindow 能绕过，但那是碰巧改了命令行拼法，不可靠。）
+//
+// 正确做法是 ShellExecuteW：它就是 C# 版 UseShellExecute=true 背后的东西，
+// 由 shell 按 URL 协议去找默认浏览器，且浏览器保持普通权限（不会被我们
+// 的管理员身份带成提权进程）。
 func (pathsT) OpenUrl(u string) {
-	if strings.TrimSpace(u) == "" {
+	u = strings.TrimSpace(u)
+	if u == "" {
 		return
 	}
-	if err := startDetached("explorer.exe", []string{u}); err != nil {
-		_ = startDetached("rundll32.exe", []string{"url.dll,FileProtocolHandler", u})
+	// 只放行 http/https，防止把奇怪字符串交给 shell
+	low := strings.ToLower(u)
+	if !strings.HasPrefix(low, "http://") && !strings.HasPrefix(low, "https://") {
+		return
 	}
+	if shellExecuteOpen(u) {
+		return
+	}
+	// 兜底：走 FileProtocolHandler
+	_ = startDetached("rundll32.exe", []string{"url.dll,FileProtocolHandler", u})
 }
 
+// OpenFolder 打开资源管理器窗口。这里是**真的要打开文件夹**，
+// 用 explorer.exe 是对的（而且必须带引号处理，见 startDetached 说明）。
 func (pathsT) OpenFolder(p string) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return
+	}
 	if !dirExists(p) {
 		_ = os.MkdirAll(p, 0o755)
 	}
+	// 打开文件夹时这里不用 ShellExecuteW：给了路径就得开资源管理器，
+	// 用 explorer.exe 语义最明确。
 	_ = startDetached("explorer.exe", []string{p})
 }
 
-// startDetached 用 CreateProcess 起一个独立进程，继承句柄给 shell 用。
+// startDetached 用 CreateProcess 起一个独立进程。
+//
+// **注意**：只用它启动「真的要开文件/文件夹」的程序（explorer、rundll32）。
+// 不要用它打开网页 —— 见 OpenUrl 的说明。
 func startDetached(exe string, args []string) error {
 	cmd := exec.Command(exe, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: false}
