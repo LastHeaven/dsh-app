@@ -13,3 +13,6 @@ last-url.txt
 .vs/
 .idea/
 *.user
+
+# 图标渲染中间产物（Chrome 临时目录，别提交）
+icon-src/.work/
