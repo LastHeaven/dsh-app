@@ -35,7 +35,7 @@ BEGIN
             VALUE "OriginalFilename", "dsh-web.exe"
             VALUE "ProductName",      "dsh web"
             VALUE "ProductVersion",   VER_PRODUCTVERSION_STR
-            VALUE "LegalCopyright",   "MIT License"
+            VALUE "LegalCopyright",   "MIT License, Copyright (c) 2026 LastHeaven"
             VALUE "Comments",         "Windows tray shell for dsh web"
         END
         // 0409 = 英文（美国），给非中文系统用
@@ -47,7 +47,7 @@ BEGIN
             VALUE "OriginalFilename", "dsh-web.exe"
             VALUE "ProductName",      "dsh web"
             VALUE "ProductVersion",   VER_PRODUCTVERSION_STR
-            VALUE "LegalCopyright",   "MIT License"
+            VALUE "LegalCopyright",   "MIT License, Copyright (c) 2026 LastHeaven"
             VALUE "Comments",         "Windows tray shell for dsh web"
         END
     END

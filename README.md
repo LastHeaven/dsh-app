@@ -106,3 +106,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File icon-src\build-icons.ps1
 这些都是运行期自动生成的，删掉会重建。程序按 **exe 所在目录**定位它们，
 所以整个目录可以整体搬到别处。
 
+## 许可
+
+[MIT License](LICENSE) © 2026 LastHeaven
+
