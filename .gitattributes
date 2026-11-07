@@ -1,0 +1,20 @@
+# 换行与编码约定
+#
+# icon-src/build-icons.ps1 必须保持 UTF-8 带 BOM：
+# Windows PowerShell 5.1 会按 GBK 解析无 BOM 的 .ps1，中文乱码后引号配对错乱、
+# 语法直接报错（这个坑在 AGENTS.md 里有记录）。
+# 下面两条避免 git 自动改换行时把它弄坏。
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+
+# 其余源码统一 LF
+*.cs       text eol=lf
+*.csproj   text eol=lf
+*.py       text eol=lf
+*.md       text eol=lf
+*.svg      text eol=lf
+
+# 二进制
+*.ico  binary
+*.png  binary
+*.exe  binary

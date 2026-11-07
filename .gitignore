@@ -1,0 +1,16 @@
+# 构建产物
+bin/
+obj/
+publish/
+out/
+
+# 图标生成的中间文件
+icon-src/.work/
+
+# 运行时产物（不应提交）
+*.log
+last-url.txt
+
+# IDE
+.vs/
+*.user
