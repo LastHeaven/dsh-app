@@ -1,0 +1,10 @@
+name: CI-Test
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - name: hello
+        run: echo ok
