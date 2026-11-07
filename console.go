@@ -120,6 +120,12 @@ type Options struct {
 	DryRun       bool
 	Headless     bool
 	ShowHelp     bool
+
+	// 更新相关
+	CheckUpdate   bool   // -CheckUpdate：查一次最新版就退出
+	UpdateTo      string // -UpdateTo <ver>：升级到指定版本（空表示 latest）
+	NoUpdateCheck bool   // -NoUpdateCheck：托盘不做后台检查
+	Force         bool   // -Force：允许重装同版本（修复损坏的安装）
 }
 
 func parseOptions(args []string) *Options {
@@ -144,6 +150,21 @@ func parseOptions(args []string) *Options {
 			o.DryRun = true
 		case "headless":
 			o.Headless = true
+		case "checkupdate":
+			o.CheckUpdate = true
+		case "noupdatecheck":
+			o.NoUpdateCheck = true
+		case "force":
+			o.Force = true
+		case "updateto", "update":
+			// -UpdateTo 后面可选跟版本号；-Update 等同于升级到 latest
+			if i+1 < len(args) {
+				next := strings.TrimSpace(args[i+1])
+				if !strings.HasPrefix(next, "-") {
+					i++
+					o.UpdateTo = next
+				}
+			}
 		case "h", "help", "?":
 			o.ShowHelp = true
 		default:
@@ -151,6 +172,9 @@ func parseOptions(args []string) *Options {
 				if n, ok := atoi(key[5:]); ok {
 					o.Port = n
 				}
+			}
+			if strings.HasPrefix(key, "updateto:") {
+				o.UpdateTo = strings.TrimSpace(args[i])[len("updateto:"):]
 			}
 		}
 	}
@@ -187,7 +211,7 @@ func printHelp() {
   dsh-web.exe -Headless     不显示托盘，按命令行跑完就退出（等同原 cmd 行为）
 
 托盘菜单：打开管理界面 / 启动 / 停止 / 重启 / 打开访问地址
-         打开安装目录 / 查看日志 / 退出`
+         更新到新版本 / 检查更新 / 打开安装目录 / 查看日志 / 退出`
 	con.Say(text)
 }
 

@@ -16,6 +16,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -27,6 +28,14 @@ func main() {
 	if opt.ShowHelp {
 		printHelp()
 		return
+	}
+
+	// 更新相关的运维动作，也是跑完就退，不构造托盘。
+	if opt.CheckUpdate {
+		os.Exit(runCheckUpdate())
+	}
+	if opt.UpdateTo != "" || isUpdateRequested(os.Args[1:]) {
+		os.Exit(runUpdateCommand(opt))
 	}
 
 	// 运维动作：跑完就退，**绝不构造托盘**。
@@ -98,6 +107,82 @@ func runHeadless(opt *Options) int {
 	}
 	con.Say("dsh web 已启动：" + url)
 	return 0
+}
+
+// runCheckUpdate 查一次最新版就退出（脚本/排障用）。
+func runCheckUpdate() int {
+	root := dshInstallRoot()
+	if root == "" {
+		con.Say("未找到 dsh 安装目录，请确认已执行：npm i -g @deepseek-ai/dsh")
+		return 1
+	}
+	con.Say("安装目录：" + root)
+	con.Say("当前版本：" + localDshVersion(root))
+
+	st := checkUpdate()
+	if st.Err != "" {
+		con.Say("检查失败：" + st.Err)
+		return 1
+	}
+	con.Say("最新版本：" + st.Latest)
+	if st.HasUpdate {
+		con.Say("有新版本可用：" + st.Current + " → " + st.Latest)
+	} else {
+		con.Say("已是最新版本。")
+	}
+	return 0
+}
+
+// runUpdateCommand 执行升级（-Update / -UpdateTo）。
+//
+// **注意这里会短暂停止服务**，所以必须提示清楚，不能静默跑。
+func runUpdateCommand(opt *Options) int {
+	target := opt.UpdateTo
+	if target == "" {
+		st := checkUpdate()
+		if st.Err != "" {
+			con.Say("检查更新失败：" + st.Err)
+			return 1
+		}
+		if !st.HasUpdate {
+			con.Say("已是最新版本（" + st.Current + "），无需升级。")
+			return 0
+		}
+		target = st.Latest
+	}
+
+	con.Say("准备升级到 " + target + "（过程中服务会短暂停止）")
+
+	// 命令行路径要显式打日志到控制台，托盘路径由 tray 自己显示
+	logf := func(format string, a ...interface{}) {
+		msg := fmt.Sprintf(format, a...)
+		con.Say(msg)
+		updateLog("%s", msg)
+	}
+
+	// 命令行升级不自动开浏览器（升级完服务已在跑，用户自己开）
+	upOpt := *opt
+	upOpt.NoBrowser = true
+
+	if err := runUpdate(target, &upOpt, logf); err != nil {
+		con.Say("升级失败：" + err.Error())
+		updateLog("升级失败：%v", err)
+		return 1
+	}
+	con.Say("升级完成：" + target)
+	updateLog("升级完成：%s", target)
+	return 0
+}
+
+// isUpdateRequested 识别裸 -Update（不带版本号）。
+func isUpdateRequested(args []string) bool {
+	for _, a := range args {
+		k := strings.ToLower(strings.TrimLeft(strings.TrimSpace(a), "-/"))
+		if k == "update" || k == "updateto" {
+			return true
+		}
+	}
+	return false
 }
 
 // diagLog 写诊断日志（托盘没有控制台，问题只能靠文件排查）。

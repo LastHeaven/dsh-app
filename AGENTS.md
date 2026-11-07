@@ -42,7 +42,8 @@
 | 文档 | 讲什么 | 什么时候看 |
 | --- | --- | --- |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 数据流、文件职责、线程模型、单实例、三态判定 | 接手项目、加功能、改结构 |
-| [docs/PITFALLS.md](docs/PITFALLS.md) | 14 个真实踩过的坑，按主题分组 | **改相关代码前必读** |
+| [docs/PITFALLS.md](docs/PITFALLS.md) | 真实踩过的坑，按主题分组 | **改相关代码前必读** |
+| [docs/UPDATE.md](docs/UPDATE.md) | 自动更新：两阶段升级、回滚、为什么不能边跑边换 | 改更新逻辑必读 |
 | [docs/TESTING.md](docs/TESTING.md) | 构建、测试纪律、发布、验证清单 | 改完代码要验证时 |
 | [README.md](README.md) | 面向用户：怎么用、命令行参数 | 想知道这程序干嘛的 |
 
@@ -62,8 +63,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 **代码结构**（详见 ARCHITECTURE）：
 
 ```
-main.go      入口分流 + runHeadless
+main.go      入口分流 + runHeadless + 更新命令
 win32.go     全部 Win32 绑定
+winhttp.go   WinHTTP（HTTPS）+ 磁盘空间
+semver.go    版本解析与比较
+update.go    更新检测 + 两阶段升级 + 回滚
 paths.go     路径/进程快照/命令行读取
 service.go   Stop/Start/LastUrl/端口归属
 tray.go      托盘窗口与消息循环

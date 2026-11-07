@@ -36,6 +36,8 @@ const (
 	cmdOpenDir
 	cmdOpenLogs
 	cmdExit
+	cmdCheckUpdate
+	cmdApplyUpdate
 	cmdSeparator = 0
 )
 
@@ -49,6 +51,13 @@ type TrayApp struct {
 	exiting    bool
 	wasRunning bool
 	menuFont   uintptr
+
+	// 更新状态。只在这个结构体里存，UI 线程和后台 goroutine
+	// 通过 postMessage(wmUpdateReady) 交接，避免并发读写界面状态。
+	upd        updateState
+	updating   bool
+	notifiedV  string // 已经弹过气泡的版本，按版本去重
+	updateStop chan struct{}
 }
 
 var tray *TrayApp
@@ -93,7 +102,61 @@ func (t *TrayApp) Run() {
 		go t.startAsync()
 	}
 
+	// 后台更新检查。必须延后启动：启动瞬间正在加载管理界面，
+	// 这会儿发 HTTPS 请求会和首屏抢资源，也容易被误当成启动卡顿。
+	if !t.opt.NoUpdateCheck {
+		t.updateStop = make(chan struct{})
+		go t.updateLoop()
+	}
+
 	t.messageLoop()
+}
+
+// updateLoop 后台周期检查更新。退出时通过 updateStop 收掉。
+func (t *TrayApp) updateLoop() {
+	select {
+	case <-time.After(updateInitialDelay):
+	case <-t.updateStop:
+		return
+	}
+
+	for {
+		if t.exiting {
+			return
+		}
+		st := checkUpdate()
+		if st.Err != "" {
+			diagLog("checkUpdate: %s", st.Err)
+			updateLog("检查更新失败：%s", st.Err)
+		} else {
+			updateLog("检查更新：当前 %s，最新 %s，有更新=%v",
+				st.Current, st.Latest, st.HasUpdate)
+		}
+		t.upd = st
+		// 回窗口线程：菜单和气泡都必须由创建窗口的线程改
+		postMessage(t.hwnd, wmUpdateReady, 0, 0)
+
+		select {
+		case <-time.After(updateInterval):
+		case <-t.updateStop:
+			return
+		}
+	}
+}
+
+// onUpdateReady 在 UI 线程处理检查结果（由 wmUpdateReady 触发）。
+func (t *TrayApp) onUpdateReady() {
+	if t.exiting || !t.upd.HasUpdate {
+		return
+	}
+	// 同一个版本只提示一次，别每 6 小时骚扰
+	if t.notifiedV == t.upd.Latest {
+		return
+	}
+	t.notifiedV = t.upd.Latest
+	t.balloon(trayTitle,
+		fmt.Sprintf("dsh 有新版本 %s，右键图标可更新。", t.upd.Latest),
+		niifInfo)
 }
 
 func (t *TrayApp) addIcon() {
@@ -155,6 +218,10 @@ func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		go tray.refreshStateAsync()
 		return 0
 
+	case wmUpdateReady:
+		tray.onUpdateReady()
+		return 0
+
 	case wmCommand:
 		// 菜单走 TPM_RETURNCMD 直接分发，这条留着给其它来源的命令消息
 		tray.dispatchCommand(uint32(wparam) & 0xFFFF)
@@ -191,6 +258,24 @@ func (t *TrayApp) showMenu() {
 	appendMenu(menu, mfString, cmdOpenDir, "打开安装目录")
 	appendMenu(menu, mfString, cmdOpenLogs, "查看日志")
 	appendMenu(menu, mfSeparator, 0, "")
+
+	// 更新区：有新版才出现「更新到 vX.Y.Z」，检查更新常驻。
+	// 升级进行中把两项都置灰，防止重复点。
+	if t.upd.HasUpdate {
+		label := "更新到 " + t.upd.Latest
+		flags := uint32(mfString)
+		if t.updating {
+			flags |= mfGrayed
+		}
+		appendMenu(menu, flags, cmdApplyUpdate, label)
+	}
+	checkFlags := uint32(mfString)
+	if t.updating {
+		checkFlags |= mfGrayed
+	}
+	appendMenu(menu, checkFlags, cmdCheckUpdate, "检查更新")
+	appendMenu(menu, mfSeparator, 0, "")
+
 	appendMenu(menu, mfString, cmdExit, "退出")
 
 	var pt point
@@ -225,6 +310,10 @@ func (t *TrayApp) dispatchCommand(cmd uint32) {
 		Paths.OpenFolder(Paths.Root())
 	case cmdOpenLogs:
 		Paths.OpenFolder(Paths.LogDir())
+	case cmdCheckUpdate:
+		go t.checkUpdateAsync()
+	case cmdApplyUpdate:
+		go t.applyUpdateAsync()
 	case cmdExit:
 		// 必须走 goroutine：exit() 里要 Stop()，最多等 20 秒，
 		// 同步跑会把消息循环卡死（窗口无法重绘、连"未响应"都可能出现）。
@@ -383,6 +472,82 @@ func (t *TrayApp) openUIAsync() {
 	}
 }
 
+// checkUpdateAsync 手动检查一次更新（菜单点击/转交命令）。
+func (t *TrayApp) checkUpdateAsync() {
+	if t.updating {
+		return
+	}
+	t.balloon(trayTitle, "正在检查更新...", niifInfo)
+
+	st := checkUpdate()
+	t.upd = st
+	if st.Err != "" {
+		updateLog("手动检查失败：%s", st.Err)
+		t.balloon(trayTitle, "检查更新失败："+st.Err, niifWarning)
+		return
+	}
+	updateLog("手动检查：当前 %s，最新 %s", st.Current, st.Latest)
+	if st.HasUpdate {
+		// 手动检查就是要看到结果，这里不走"只提示一次"的去重
+		t.notifiedV = st.Latest
+		t.balloon(trayTitle,
+			fmt.Sprintf("发现新版本 %s（当前 %s），右键可更新。", st.Latest, st.Current),
+			niifInfo)
+	} else {
+		t.balloon(trayTitle, "已是最新版本（"+st.Current+"）。", niifInfo)
+	}
+}
+
+// applyUpdateAsync 执行升级。
+//
+// 阶段 A（下载）服务照常跑；阶段 B（换目录）会短暂停机。
+// 整个流程在 goroutine 里，绝不能在 wndProc 里同步跑。
+func (t *TrayApp) applyUpdateAsync() {
+	if t.updating {
+		return
+	}
+	if !t.upd.HasUpdate || t.upd.Latest == "" {
+		t.balloon(trayTitle, "没有可用的新版本，请先检查更新。", niifWarning)
+		return
+	}
+
+	target := t.upd.Latest
+	t.updating = true
+	t.busy = true
+	t.setIcon(t.icons.busy)
+	t.setText("dsh web：正在更新到 " + target + "...")
+	t.balloon(trayTitle,
+		"正在下载 "+target+"，服务暂时保持运行。完成后会自动重启。", niifInfo)
+
+	logf := func(format string, a ...interface{}) {
+		msg := fmt.Sprintf(format, a...)
+		updateLog("%s", msg)
+		diagLog("update: %s", msg)
+	}
+
+	upOpt := *t.opt
+	upOpt.NoBrowser = true
+
+	err := runUpdate(target, &upOpt, logf)
+
+	t.updating = false
+	t.busy = false
+	invalidateSnapshot()
+
+	if err != nil {
+		t.setIcon(t.icons.stopped)
+		t.refreshState()
+		t.balloon(trayTitle, "更新失败："+err.Error(), niifError)
+		return
+	}
+
+	// 升级成功后状态全变了：重新读版本、刷新地址
+	t.url = LastUrl(t.opt.Port)
+	t.upd = updateState{Current: target, Latest: target, CheckedAt: time.Now()}
+	t.refreshState()
+	t.balloon(trayTitle, "已更新到 "+target+"。", niifInfo)
+}
+
 // exit 退出托盘。
 //
 // **退出要顺手停掉它管的那个服务。** 用户点「退出」的意思是"托盘不要了，
@@ -400,6 +565,12 @@ func (t *TrayApp) exit() {
 		return
 	}
 	t.exiting = true
+
+	// 收掉后台更新检查，别让它在退出过程中还发请求
+	if t.updateStop != nil {
+		close(t.updateStop)
+		t.updateStop = nil
+	}
 
 	// 先把图标收掉，让用户立刻看到"退出了"，别等 Stop 慢慢等
 	t.nid.Flags = nifMessage | nifIcon | nifTip

@@ -17,7 +17,11 @@
 | 灰色鲸鱼 | 未运行 |
 
 左键点击 = 打开管理界面。右键菜单：打开管理界面 / 启动 / 停止 / 重启 /
-打开访问地址 / 打开安装目录 / 查看日志 / 退出。
+打开访问地址 / 更新到新版本 / 检查更新 / 打开安装目录 / 查看日志 / 退出。
+
+**自动更新**：托盘每 6 小时在后台查一次 dsh 有没有新版本，发现后气泡提示，
+右键即可一键升级。升级过程分两段 —— 先在后台下载（服务照常运行），
+再短暂停机几秒换目录。失败会自动回滚到旧版。详见 [docs/UPDATE.md](docs/UPDATE.md)。
 
 **命令行**（跑完即退，不显示托盘，供脚本和计划任务调用）：
 
@@ -29,6 +33,11 @@ dsh-web.exe -DryRun         只检测并输出
 dsh-web.exe -NoBrowser      不自动打开浏览器
 dsh-web.exe -KeepExisting   不关闭已有实例
 dsh-web.exe -Headless       不显示托盘，按命令行跑完就退出
+dsh-web.exe -CheckUpdate    查一次新版本就退出
+dsh-web.exe -Update         升级到最新版
+dsh-web.exe -UpdateTo 1.2.3 升级到指定版本
+dsh-web.exe -Force          配合 -UpdateTo，允许重装同版本（修复损坏的安装）
+dsh-web.exe -NoUpdateCheck  托盘不做后台更新检查
 dsh-web.exe -Help           帮助
 ```
 
@@ -72,6 +81,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File icon-src\build-icons.ps1
 程序把日志和"最近一次访问地址"写在 exe 旁边：
 
 - `logs\dsh-web.out.log` / `.err.log` — node 的 stdout / stderr
+- `logs\update.log` — 更新检查与升级记录（UTF-8；用 PowerShell 看得加 `-Encoding UTF8`）
 - `last-url.txt` — 最近一次启动拿到的带 token 地址
 - `headless.log` — 命令行模式的关键输出（控制台不可用时的兜底）
 

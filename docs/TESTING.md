@@ -75,6 +75,59 @@ Copy-Item .\publish\dsh-web.exe D:\agents\dsh\dsh-web.exe -Force
 部署目录**只有 exe**，另外运行期自动生成 `logs\`、`headless.log`、
 `last-url.txt`、`tray-diag.log`。
 
+## 更新功能怎么验
+
+更新会动全局安装目录，**风险最高的模块**。分三层验：
+
+### 1. 单元测试（每次改都跑，秒级）
+
+```powershell
+go test ./...
+```
+
+覆盖 SemVer 比较（重点是 `rc.10 > rc.9` 这种数值段）、`isNewer` 的
+"垃圾输入一律不报更新"、JSON 顶层键抽取（不能取到 `dependencies` 里的同名键）、
+URL 拆分。
+
+### 2. 只读验证（不碰任何东西）
+
+```powershell
+dsh-web.exe -CheckUpdate
+```
+
+会打印安装目录、当前版本、最新版本。**这个命令完全不写入**，
+随时可以跑。改完检测逻辑先跑它。
+
+### 3. 完整升级（必须用隔离端口）
+
+```powershell
+# 记基线
+$base = (Get-NetTCPConnection -LocalPort 3080 -State Listen).OwningProcess
+
+# 起一个 3199 实例当"受害者"
+dsh-web.exe -Port 3199 -NoBrowser -Headless
+
+# 强制重装同版本 —— 等价于完整跑一遍阶段 A + 阶段 B
+dsh-web.exe -UpdateTo <当前版本> -Force -Port 3199
+
+# 比对 3080
+$now = (Get-NetTCPConnection -LocalPort 3080 -State Listen).OwningProcess
+"3080: $now (baseline $base) -> " + $(if($now -eq $base){"PASS"}else{"FAIL"})
+```
+
+`-Force` + 同版本是**刻意设计**的测试手段：它完整走一遍下载 → 换目录 →
+启动 → 校验 → 回滚路径，但版本号不变，风险最小。
+
+失败路径也要验：`-UpdateTo 9.9.9` 这种不存在的版本，必须
+「报 ETARGET + 删干净 stage + 服务不动」。验完检查：
+
+```powershell
+Test-Path D:\npm\.dsh-web-stage            # 必须是 False
+(Get-Content ...\dsh\package.json | ConvertFrom-Json).version   # 必须没变
+```
+
+改升级逻辑前先读 [UPDATE.md](UPDATE.md)。
+
 ## 图标重新生成
 
 改了鲸鱼形状或配色后：
@@ -91,8 +144,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File icon-src\build-icons.ps1
 改完发版前过一遍：
 
 - [ ] `go vet` 0 告警
+- [ ] `go test ./...` 全过
 - [ ] `-DryRun` 能识别到运行中的实例
 - [ ] `-Help` 中文不乱码
+- [ ] `-CheckUpdate` 能正确报告版本
 - [ ] 3199 起服务 → 托盘变黑鲸鱼 → 退出 → 3199 进程和端口都消失
 - [ ] 退出后用 3199 重启，不报端口占用
 - [ ] 全程 3080 的 PID 未变

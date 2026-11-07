@@ -49,6 +49,7 @@ var (
 	procSleep                = modkernel32.NewProc("Sleep")
 	procLocalFree            = modkernel32.NewProc("LocalFree")
 	procGetTickCount64       = modkernel32.NewProc("GetTickCount64")
+	procGetDiskFreeSpaceEx   = modkernel32.NewProc("GetDiskFreeSpaceExW")
 	procCreateToolhelp32Snap = modkernel32.NewProc("CreateToolhelp32Snapshot")
 	procProcess32FirstW      = modkernel32.NewProc("Process32FirstW")
 	procProcess32NextW       = modkernel32.NewProc("Process32NextW")
@@ -120,6 +121,9 @@ const (
 	wmApp         = 0x8000
 	wmNull        = 0x0000
 	wmCommand     = 0x0111
+
+	// 自定义消息：后台更新检查完成（WM_APP+1，避开菜单的 WM_APP 回调）
+	wmUpdateReady = 0x8001
 
 	// 菜单
 	mfString       = 0x0000

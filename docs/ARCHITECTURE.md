@@ -16,8 +16,18 @@ main()
      │    ├─ RegisterClassExW + CreateWindowExW(HWND_MESSAGE)  隐藏消息窗口
      │    ├─ Shell_NotifyIcon(NIM_ADD)
      │    ├─ SetTimer(poll, 3000ms) → 定期 refreshState()
+     │    ├─ go updateLoop()      延迟 90s 起，每 6 小时查一次新版本
+     │    │    └─ 结果 postMessage(wmUpdateReady) 回窗口线程
      │    └─ GetMessage / DispatchMessage 循环
      └─ 命令来自两处：菜单(TPM_RETURNCMD) 和 命名管道（第二实例转发）
+```
+
+另有三条更新命令（同样跑完即退，不构造托盘）：
+
+```
+-CheckUpdate   → runCheckUpdate()      查一次，打印结果
+-Update        → runUpdateCommand()    升到 latest
+-UpdateTo x.y  → runUpdateCommand()    升到指定版本
 ```
 
 ## 文件职责
@@ -32,6 +42,11 @@ main()
 | `single.go` | 互斥体 + 命名管道单实例转发 |
 | `console.go` | 控制台 shim、`Options` 解析、帮助文本 |
 | `icons.go` | 内嵌 ICO → 临时文件 → `LoadImageW` |
+| `winhttp.go` | WinHTTP 绑定（HTTPS 客户端）、URL 拆分、磁盘空间查询 |
+| `semver.go` | SemVer 解析与比较（预发布版本、数值段） |
+| `update.go` | 版本检测、dist-tags 拉取、两阶段升级与回滚、手写 JSON 抽取 |
+
+更新的完整设计见 [UPDATE.md](UPDATE.md)。
 
 ## 线程模型
 
@@ -40,10 +55,11 @@ main()
 | 线程 | 能做什么 |
 | --- | --- |
 | 主线程（消息循环） | 创建/销毁窗口、`Shell_NotifyIcon`、跑 `wndProc` |
-| goroutine | 一切耗时操作：`Start()`、`Stop()`、打开网页/文件夹 |
+| goroutine | 一切耗时操作：`Start()`、`Stop()`、打开网页/文件夹、更新检查与升级 |
 
-`wndProc` 是回调，**绝不能在里面做耗时操作**，否则整个托盘卡死。
-所以菜单命令都转成 `go t.xxxAsync()`。
+`wndProc` 是回调，**绝不能在里面做耗时操作**（包括联网），否则整个托盘卡死。
+所以菜单命令都转成 `go t.xxxAsync()`；后台检查更新也走 goroutine，
+结果用 `postMessage(wmUpdateReady)` 交回窗口线程再动菜单和气泡。
 
 反过来说，goroutine 里**不能**直接 `CreateWindow` / `DestroyWindow` /
 `TrackPopupMenu`（有线程亲和性）。退出路径就是因此用
@@ -77,6 +93,9 @@ main()
    `new TrayApp(...)`，导致短暂闪出托盘图标、甚至走错启动分支。
 2. **`Stop()` 只停本端口那一个。** 见 [PITFALLS.md](PITFALLS.md#-stop-的判定必须按命令行---port不能猜)。
 3. **打开网页走 `ShellExecuteW`，打开文件夹走 `explorer.exe`。**
+4. **升级绝不在服务运行时改安装目录。** 运行中 `sharp.node`/`koffi.node`
+   被独占锁定，`npm install` 会报 EBUSY 并把树改坏一半，连目录改名都会被拒。
+   必须走「阶段 A 下载 → 阶段 B 停服换目录」，见 [UPDATE.md](UPDATE.md)。
 
 ## 为什么零第三方依赖
 

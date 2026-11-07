@@ -164,6 +164,122 @@ Go 会按 MS 转义规则把参数拼成命令行，而 `explorer.exe` 对引号
 
 ---
 
+## 更新机制
+
+### 服务运行中改安装目录必定失败
+
+**不是"可能失败"，是必定失败。** 实测：服务跑着的时候 `sharp.node` 和
+`koffi.node` 处于独占锁定状态，此时
+
+```
+npm install（换版本） → EBUSY -4082，rename 失败
+Rename-Item 整目录    → Access to the path is denied
+Directory.Move        → Access to the path is denied
+```
+
+更麻烦的是 npm 失败后**树被改坏一半**：`package.json` 要求 `node-pty@1.0.0`，
+实际装的是 `1.1.0`，`npm ls` 报 `ELSPROBLEMS`。新版没生效、旧版也不完整。
+
+所以升级必须走「先停服务，再换目录」，见 [UPDATE.md](UPDATE.md)。
+
+### 别用 `net/http` 做更新检查
+
+实测二进制体积：
+
+| 做法 | 体积 |
+| --- | --- |
+| 无网络能力 | 3,140,608 B |
+| WinHTTP P/Invoke | 3,212,288 B（+68 KB） |
+| `net/http` + `encoding/json` | 5.62 MB（+2.6 MB） |
+
+`net/http` 会拖进 http2、DNS resolver、reflect。为了查一个 67 字节的
+dist-tags 多付 2.6 MB，等于把 Go 重写省下的体积还回去一半。
+
+同理 `encoding/json` 单独就要 +264 KB（实测），所以 JSON 是手写的。
+**手写解析只认深度 1 的键** —— package.json 的 `dependencies` 里也有
+`@deepseek-ai/dsh` 这种同名键，不限制深度会把依赖的版本当成包自己的版本。
+
+### WinHTTP 的坑
+
+1. **必须带 `WINHTTP_FLAG_SECURE(0x00800000)`**，否则它按明文 HTTP 发，
+   服务器回 `400 The plain HTTP request was sent to HTTPS port`。
+2. **`WinHttpQueryHeaders` 要加 `WINHTTP_QUERY_FLAG_NUMBER`**，不加拿到的
+   不是 DWORD，状态码永远读成 0。
+3. **一定要设超时**（`WinHttpSetTimeouts`）。没超时的 HTTPS 调用在托盘程序里
+   等于线程泄漏，DNS 卡住时 goroutine 会挂几个小时。
+4. 默认走系统代理（`WINHTTP_ACCESS_TYPE_DEFAULT_PROXY`），这点比自己实现要好。
+
+### 升级不能被"同版本"挡住
+
+最初的正则是"目标必须比本地新"，结果连**修复损坏安装**都做不了。
+现在拆成三种情况：
+
+- 目标更新 → 正常升级
+- 目标相同 → 拒绝，除非 `-Force`
+- 目标更旧 → 拒绝，除非 `-Force`
+
+`-Force` 存在的理由就是：服务运行时 npm 把树改坏之后，"重装同版本"
+是唯一修复手段。
+
+### 备份目录要唯一名字，删不掉也不能阻塞升级
+
+**Windows 上文件被映射时，删除和目录改名都会失败** —— 目录重命名会检查
+内部文件是否被打开。备份里恰好有 `libvips-42.dll` 这类 native 库，只要有过
+node 进程映射它（哪怕进程已死、映射未释放），就会：
+
+```
+os.RemoveAll(backup) → Access is denied
+os.Rename(backup, x) → Access is denied
+```
+
+用定长 `.dsh-web-old` 的话，**下一次升级会被永久堵死**：清理失败就中止，
+而清理永远失败。
+
+规则：
+
+1. 备份名带纳秒时间戳（`.dsh-web-old-<UnixNano>`），每次都是新路径；
+2. 开头扫历史备份尽力删，**删不掉就跳过，绝不阻塞**；
+3. 结尾限时 12 秒删，超时留给下次。
+
+同理，`go os.RemoveAll(...)` 做删除也是错的：737 MB 要 18 秒，
+命令行模式跑完就 `os.Exit`，goroutine 被掐掉，备份原封不动留着。
+
+### `npm install --prefix` 和 `-g --prefix` 布局不同
+
+**这条实际踩到过，值得单独记。**
+
+不带 `-g` 是"本地安装"语义，依赖**横向提升到 `<stage>\node_modules` 平铺**；
+带上 `-g` 才是"全局安装"语义，依赖**嵌套在包自己的 `node_modules` 里**。
+
+而真正装到 `D:\npm` 的是后者：扁平层 `@deepseek-ai` 只有 dsh 一个，
+329 个依赖全在 `dsh\node_modules\@deepseek-ai` 下面。
+
+拿平铺的树去换目录，dsh 启动立刻报：
+
+```
+ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/dsh-app-boot'
+imported from D:\npm\node_modules\@deepseek-ai\dsh\lib\bin.js
+```
+
+**回滚在这里救了一次**：新版本起不来 → 自动换回旧版 → 重新拉起，
+用户只看到"更新失败"，服务没断过。
+
+### 备份目录不能放进 `@deepseek-ai` 作用域
+
+`installRoot + ".old"` 看着自然，实际会变成
+`node_modules\@deepseek-ai\dsh.old` —— 而 npm 扫 `node_modules` 时
+**不校验目录名合法性，只要是目录就当已安装的包**：
+
+```
++-- @deepseek-ai/dsh.broken@npm:@deepseek-ai/dsh@0.2.2-rc.1
++-- @deepseek-ai/dsh@0.2.2-rc.1
+```
+
+`npm ls -g` 里出现两个 dsh，后续操作都会被污染。
+所以备份/损坏副本一律放 `<prefix>\.dsh-web-old`、`<prefix>\.dsh-web-broken`。
+
+---
+
 ## 路径与文件
 
 ### `last-url.txt` 里的地址必须校验端口
