@@ -538,29 +538,49 @@ namespace DshWebLauncher
             return url;
         }
 
-        // 最近一次启动写入的地址；没有就读日志里最后一个
-        public static string LastUrl()
+        // 最近一次启动写入的地址；没有就读日志里最后一个。
+        //
+        // 必须校验端口：last-url.txt 是历史遗留文件，可能还留着别的端口的地址
+        // （调试时用 -Port 3199 起过实例就会写进去）。不校验的话，托盘会打开一个
+        // 早已失效的端口，表现为"点开页面却是 3199"。
+        public static string LastUrl(int port)
         {
             try
             {
                 if (File.Exists(Paths.UrlFile))
                 {
                     var last = File.ReadAllText(Paths.UrlFile).Trim();
-                    if (Regex.IsMatch(last, @"^https?://")) return last;
+                    if (UrlMatchesPort(last, port)) return last;
                 }
             }
             catch { }
 
+            // 文件没写或端口不符，从日志里找该端口的最后一个地址（倒序找）
             try
             {
                 if (File.Exists(Paths.OutLog))
                 {
-                    var m = Regex.Matches(File.ReadAllText(Paths.OutLog), @"https?://[^\s""']+");
-                    if (m.Count > 0) return m[m.Count - 1].Value;
+                    var all = Regex.Matches(File.ReadAllText(Paths.OutLog), @"https?://[^\s""']+");
+                    for (int i = all.Count - 1; i >= 0; i--)
+                    {
+                        if (UrlMatchesPort(all[i].Value, port)) return all[i].Value;
+                    }
                 }
             }
             catch { }
             return null;
+        }
+
+        // 地址里的端口是否就是我们要的那个
+        private static bool UrlMatchesPort(string url, int port)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return false;
+            try
+            {
+                var u = new Uri(url);
+                return u.Port == port;
+            }
+            catch { return false; }
         }
     }
 
@@ -678,7 +698,7 @@ namespace DshWebLauncher
             menu.Items.Add(Item("停止", async (s, e) => await StopAsync()));
             menu.Items.Add(Item("重启", async (s, e) => await RestartAsync()));
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(Item("打开访问地址", (s, e) => Paths.OpenUrl(_url ?? DshService.LastUrl())));
+            menu.Items.Add(Item("打开访问地址", (s, e) => Paths.OpenUrl(_url ?? DshService.LastUrl(_opt.Port))));
             menu.Items.Add(Item("打开安装目录", (s, e) => Paths.OpenFolder(Paths.Root)));
             menu.Items.Add(Item("查看日志", (s, e) => Paths.OpenFolder(Paths.LogDir)));
             menu.Items.Add(new ToolStripSeparator());
@@ -831,7 +851,8 @@ namespace DshWebLauncher
 
         private async Task OpenUiAsync()
         {
-            var url = _url ?? DshService.LastUrl();
+            // 只认本端口的地址，历史遗留的别的端口要忽略
+            var url = _url ?? DshService.LastUrl(_opt.Port);
             if (url != null)
             {
                 Paths.OpenUrl(url);
@@ -842,7 +863,7 @@ namespace DshWebLauncher
             {
                 _icon.ShowBalloonTip(3000, Title, "dsh web 未运行，正在启动...", ToolTipIcon.Info);
                 await StartAsync();
-                var fresh = _url ?? DshService.LastUrl();
+                var fresh = _url ?? DshService.LastUrl(_opt.Port);
                 if (fresh != null) Paths.OpenUrl(fresh);
             }
             else
