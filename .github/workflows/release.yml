@@ -93,7 +93,11 @@ jobs:
           "version=$v" >> $env:GITHUB_OUTPUT
           "numeric=$numeric" >> $env:GITHUB_OUTPUT
           "is_tag=$isTag" >> $env:GITHUB_OUTPUT
-          "prerelease=$($v.Contains('-'))" >> $env:GITHUB_OUTPUT
+          # 注意：PowerShell 的 $v.Contains('-') 输出 True/False（首字母大写），
+          # 直接写进 output 后与 'true' 比较永远不相等，导致预发布版永远
+          # 不会被标记成 prerelease。必须显式转小写。
+          $pre = if ($v.Contains('-')) { 'true' } else { 'false' }
+          "prerelease=$pre" >> $env:GITHUB_OUTPUT
 
       - name: 构建
         shell: pwsh
