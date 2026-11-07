@@ -172,6 +172,26 @@ Go 的 exec.Command 会按 MS 转义规则把参数拼成命令行，而 `explor
 `OpenFolder`（打开安装目录/日志）**仍然用 explorer.exe** —— 那里是真的要开
 文件夹，语义正确，别一起改掉。
 
+### 14. 退出托盘要顺手停掉它管的服务
+
+**症状**：点「退出」，托盘图标消失了，但 dsh web 还在后台跑 —— 下次启动
+撞端口占用，或者用户以为关了其实没关。
+
+**规则**：`exit()` 必须先 `Stop(t.opt.Port)` 再收尾。
+停的仍然是本端口那一个（见第 1 条），不要退化成"停所有"。
+
+**两个实现细节，改动时别丢**：
+
+1. `exit()` 里 `Stop()` 最多会等 20 秒，必须由 **goroutine** 调用
+   （`dispatchCommand` 里 `go t.exit()`）。同步调会卡死消息循环。
+2. `DestroyWindow` 只能在创建窗口的那个线程上调，而 `exit()` 跑在
+   goroutine 里。所以它最后是 `PostMessage(hwnd, WM_CLOSE)` 绕回
+   `wndProc`，由 `wmClose` 分支在本线程 `destroyWindow`。
+   **不要在 goroutine 里直接 destroyWindow。**
+
+顺序上先 `Shell_NotifyIcon(NIM_DELETE)` 收图标，再 `Stop()` ——
+让用户立刻看到"退出了"，不必等进程终结。
+
 ## 代码结构
 
 | 文件 | 职责 |

@@ -161,6 +161,9 @@ func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		return 0
 
 	case wmClose:
+		// 退出路径的收尾：把窗口销毁掉（随后会收到 WM_DESTROY → 退出消息循环）。
+		// 必须在本线程做，所以 exit() 用 PostMessage(WM_CLOSE) 绕回这里。
+		destroyWindow(hwnd)
 		return 0
 
 	case wmDestroy:
@@ -223,7 +226,9 @@ func (t *TrayApp) dispatchCommand(cmd uint32) {
 	case cmdOpenLogs:
 		Paths.OpenFolder(Paths.LogDir())
 	case cmdExit:
-		t.exit()
+		// 必须走 goroutine：exit() 里要 Stop()，最多等 20 秒，
+		// 同步跑会把消息循环卡死（窗口无法重绘、连"未响应"都可能出现）。
+		go t.exit()
 	}
 }
 
@@ -378,12 +383,38 @@ func (t *TrayApp) openUIAsync() {
 	}
 }
 
+// exit 退出托盘。
+//
+// **退出要顺手停掉它管的那个服务。** 用户点「退出」的意思是"托盘不要了，
+// 它管的 dsh web 也别留着"；早先这里只收图标、不动进程，结果是退了托盘
+// node 还在后台跑，下次启动还会撞端口占用。
+//
+// 停的仍然是 Stop(t.opt.Port) —— 只停命令行里 --port 等于本端口的那一个，
+// 绝不波及别的端口上的实例（改这里之前先读 AGENTS.md 第 1 条）。
+//
+// 注意这一段是**同步**跑的，Stop 里最多会等 20 秒等进程退出。
+// dispatchCommand 用 goroutine 调本函数，所以不会卡住消息循环；
+// 但不要在 UI 线程（wndProc）里直接调它。
 func (t *TrayApp) exit() {
+	if t.exiting {
+		return
+	}
 	t.exiting = true
+
+	// 先把图标收掉，让用户立刻看到"退出了"，别等 Stop 慢慢等
 	t.nid.Flags = nifMessage | nifIcon | nifTip
 	shellNotifyIcon(nimDelete, &t.nid)
+
+	n := Stop(t.opt.Port)
+	diagLog("exit: port=%d stopped=%d", t.opt.Port, n)
+
 	t.icons.close()
-	destroyWindow(t.hwnd)
+
+	// DestroyWindow 必须在创建窗口的那个线程（消息循环线程）上调用。
+	// 本函数跑在 goroutine 里，所以不能直接 destroyWindow，
+	// 改成往窗口投一个 WM_CLOSE，由 wndProc 在自己的线程上销毁。
+	// （wndProc 的 wmClose 分支就是干这个的）
+	postMessage(t.hwnd, wmClose, 0, 0)
 }
 
 // handleForwarded 处理第二个实例转交过来的命令。
