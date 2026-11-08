@@ -53,6 +53,8 @@ var (
 	procCreateToolhelp32Snap = modkernel32.NewProc("CreateToolhelp32Snapshot")
 	procProcess32FirstW      = modkernel32.NewProc("Process32FirstW")
 	procProcess32NextW       = modkernel32.NewProc("Process32NextW")
+	procCreateThread         = modkernel32.NewProc("CreateThread")
+	procGetCurrentThreadId   = modkernel32.NewProc("GetCurrentThreadId")
 
 	// user32
 	procRegisterClassExW      = moduser32.NewProc("RegisterClassExW")

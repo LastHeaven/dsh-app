@@ -446,6 +446,60 @@ go func() {
 **注意**：给 `wndProc` 加 `defer` 清空诊断字段是错的 —— 卡死时函数
 根本不返回，defer 不会执行，反而误以为"信息被抹掉了"。
 
+### 托盘必须 runtime.LockOSThread，否则消息循环收不到消息
+
+**这是整个项目最隐蔽的 bug，排查了两轮才定位。**
+
+**症状**：托盘用一段时间或启动服务后，右键不出菜单、左键也没反应。
+进程活着、`Responding` 显示 **True**、CPU 占用为 0 —— 从外部看完全正常，
+但点它没有任何反应。杀掉重启又能用一阵。
+
+**根因**：Win32 的窗口、定时器、消息队列全部绑定在**创建它的那个 OS 线程**上：
+
+- `CreateWindowExW` 建窗口时记录当时的线程
+- `SetTimer(hwnd, ...)` 把定时器挂到**调用它的那个线程**的消息队列
+- `GetMessage` 只能取到**本线程**的消息
+
+而 Go 的 goroutine 会在 OS 线程之间**自由迁移**。`Run()` 在主 goroutine 里
+依次做 `CreateWindowExW` → `SetTimer` → `GetMessage`，但中间任意时刻
+Go 运行时都可能把这个 goroutine 挪到另一条 OS 线程。一旦发生：
+
+- 窗口和定时器留在旧线程
+- `GetMessage` 在新线程上空等
+- **WM_TIMER 和托盘回调永远收不到**
+
+表现就是托盘彻底失去响应，而所有 Win32 调用都"成功"了。
+
+**定位方法**：看门狗 + `runtime.Stack`。怀疑卡死时 dump 全部 goroutine：
+
+```
+goroutine 1 [syscall]:
+    syscall.SyscallN(...)
+    main.getMessage(...)
+    dsh-web/win32.go:479
+    main.(*TrayApp).messageLoop(...)
+    dsh-web/tray.go:316
+```
+
+看到「卡在 `getMessage` 的 syscall」就对了 —— 但注意这本身是**正常的空闲
+等待**，不是死锁。真正的异常是「心跳不涨 + 定时器该响而没响」。
+
+**修法**：在 `main` 里建窗口之前锁死线程。
+
+```go
+func main() {
+	...
+	runtime.LockOSThread()   // 必须在 CreateWindow 之前
+
+	setProcessDpiAwarenessContext(...)
+	newTrayApp(opt).Run()    // 建窗口 + 定时器 + 消息循环，全在这条线程上
+}
+```
+
+`LockOSThread` 之后 main goroutine 终身绑定一条 OS 线程，三者不会分离。
+
+实测：修复前 5 轮压力测试第 3 轮必现，修复后 6 轮全部正常。
+
 ---
 
 ## 路径与文件

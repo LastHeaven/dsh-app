@@ -4,6 +4,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -241,7 +243,16 @@ func (t *TrayApp) reAddIcon(reason string) bool {
 		return false
 	}
 
-	nidMu.Lock()
+	// 本函数既可能被 UI 线程调（TaskbarCreated、checkIconAlive），
+	// 也可能被 goroutine 调。**UI 线程上不能阻塞等锁** ——
+	// 这里统一用 TryLock，拿不到就交给下一轮：
+	// TaskbarCreated 有 10 秒一次的自检兜底，晚一点重建没关系，
+	// 但让 UI 线程卡住等锁会直接导致"整个托盘点不动"。
+	if !nidMu.TryLock() {
+		diagLog("reAddIcon: reason=%s 拿不到锁，跳过本轮", reason)
+		return false
+	}
+
 	shellNotifyIcon(nimDelete, &t.nid)
 
 	// 重建时把 nid 恢复到"完整状态"：图标 + 提示文字 + 回调消息
@@ -272,11 +283,20 @@ func (t *TrayApp) reAddIcon(reason string) bool {
 //
 // 改用 NIM_MODIFY 的返回值：图标若已从 shell 注销，MODIFY 会返回 FALSE。
 // 这是唯一不依赖 GetRect、又能真实反映注册状态的信号。
+//
+// **本函数跑在 UI 线程上，绝对不能阻塞等锁**：nidMu 可能正被 goroutine
+// 里的 setIcon/setText 长时间持有（startAsync 启动服务要 8 秒，
+// 期间会多次 setIcon/setText）。UI 线程一等，消息循环立刻停摆，
+// 用户看到的就是"右键点不动、左键也没反应"。
+// 所以这里用 TryLock：拿不到就直接跳过这一轮，10 秒后再试即可。
 func (t *TrayApp) checkIconAlive() {
 	if t.exiting || t.hwnd == 0 {
 		return
 	}
-	nidMu.Lock()
+	if !nidMu.TryLock() {
+		// 拿不到锁说明有 goroutine 正在改状态，跳过这轮
+		return
+	}
 	f := uint32(nifMessage | nifIcon | nifTip)
 	t.nid.Flags = f
 	ok := shellNotifyIcon(nimModify, &t.nid)
@@ -316,6 +336,7 @@ func (t *TrayApp) messageLoop() {
 }
 
 // wndProc 是回调，**不能**做耗时操作（会卡住整个托盘）。
+
 func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	if tray == nil {
 		return defWindowProc(hwnd, msg, wparam, lparam)
@@ -323,6 +344,12 @@ func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 
 	// 每次进回调先打心跳：看门狗据此判断 UI 线程是否还活着。
 	atomic.AddInt64(&uiHeartbeat, 1)
+
+	// 调试模式：把每条消息都记进日志，用于定位卡死点。
+	// 用环境变量开启，平时零开销。
+	if debugMsgs {
+		diagLog("wndProc: msg=0x%04X wparam=0x%X lparam=0x%X", msg, wparam, lparam)
+	}
 
 	switch msg {
 	case wmApp:
@@ -377,12 +404,59 @@ func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 
 // showMenu 弹右键菜单。
 //
-// 这里有个 Windows 的顽固限制：**弹菜单前必须把窗口设为前台**，
-// 否则菜单一显示就立刻被关掉（表现为"右键没反应"）。
-// 而 SetForegroundWindow 只在满足一堆条件时才真的生效 ——
-// 我们的托盘进程几乎从不满足，所以必须配一个标准的变通手法，
-// 见下面 SetForegroundWindow 前后的注释。
+// **本函数绝不能直接调用 trackPopupMenu。**
+//
+// TrackPopupMenu 是同步阻塞的 —— 它内部会跑一个消息泵，等用户点选。
+// 如果直接在 wndProc（Go 的回调，syscall.NewCallback）里调它，
+// TrackPopupMenu 的消息泵会**重入 wndProc**，形成 Go 回调嵌套。
+// Go 运行时不支持这种嵌套，结果就是整个消息循环死锁：
+// 进程还活着、Responding 仍是 True，但再也不处理任何消息。
+// 实测：右键或左键点击后必现，连 ESC 和鼠标点击都无法唤醒。
+//
+// 正确做法：另起一个**原生线程**专门弹菜单，UI 线程只负责
+// 把自己设为前台窗口然后立刻返回。菜单线程阻塞不影响消息循环。
+//
+// 这里用 CreateThread 而不是 Go 的 goroutine：goroutine 最终要落在
+// 某个 OS 线程上，而 Go 可能把它调度到正在跑 wndProc 的那个线程，
+// 问题依旧。CreateThread 拿到的是一条干净的原生线程。
 func (t *TrayApp) showMenu() {
+	var pt point
+	getCursorPos(&pt)
+
+	// 前台切换必须在 UI 线程做（有线程亲和性），且要尽快返回。
+	// SetForegroundWindow 只在系统认可"用户刚有过输入"时生效，
+	// 所以先发一个假的 ALT 键解锁前台切换权限。
+	simulateAltKey()
+	setForegroundWindow(t.hwnd)
+
+	// 菜单构建 + TrackPopupMenu 全部交给独立线程
+	go popupMenuOnOwnThread(t, pt)
+}
+
+// popupMenuOnOwnThread 在独立的原生线程上弹菜单。
+func popupMenuOnOwnThread(t *TrayApp, pt point) {
+	// 用 CreateThread 拿一条干净的原生线程；Go 的 goroutine 可能被
+	// 调度回正在跑 wndProc 的线程，那样等于没解决重入问题。
+	done := make(chan struct{})
+	cb := syscall.NewCallback(func(_ uintptr) uintptr {
+		t.buildAndTrackMenu(pt)
+		close(done)
+		return 0
+	})
+	h, _, _ := procCreateThread.Call(0, 0, cb, 0, 0, 0)
+	if h == 0 {
+		// 建线程失败就退化成当前线程弹（可能重入，但总比不弹好）
+		diagLog("showMenu: CreateThread 失败，退化到当前线程")
+		t.buildAndTrackMenu(pt)
+		return
+	}
+	closeHandle(h)
+	<-done
+}
+
+// buildAndTrackMenu 构建菜单并阻塞等待用户选择。
+// 在专用线程上运行，阻塞是安全的。
+func (t *TrayApp) buildAndTrackMenu(pt point) {
 	menu := createPopupMenu()
 	if menu == 0 {
 		return
@@ -419,31 +493,19 @@ func (t *TrayApp) showMenu() {
 
 	appendMenu(menu, mfString, cmdExit, "退出")
 
-	var pt point
-	getCursorPos(&pt)
-
-	// **弹菜单前必须让本窗口成为前台窗口**，否则菜单显示后立即被关掉，
-	// 表现为"右键点了没反应"。
+	// 坐标由调用方（UI 线程）取好传进来：菜单线程上取到的光标位置
+	// 可能已经变了（用户把鼠标移开了）。
 	//
-	// 但 SetForegroundWindow 只在系统认可"用户刚有过输入"时才生效，
-	// 否则静默返回 false。实测：dsh 窗口（或浏览器）在前台时，
-	// 直接调用 100% 失败，TrackPopupMenu 随即卡住不返回 ——
-	// 用户看到的就是右键菜单永远出不来。
-	//
-	// 标准变通手法（MSDN 的托盘示例同款）：先发一个假的 ALT 键，
-	// 让系统解锁前台切换权限，再调用 SetForegroundWindow。
-	simulateAltKey()
-	setForegroundWindow(t.hwnd)
-
-	// MSDN 的托盘示例在 TrackPopupMenu 之后还会补一条 WM_NULL。
-	// 作用是让菜单管理器知道"菜单这一轮结束了"，否则某些情况下
-	// 菜单状态会残留在 shell 里，下一次右键直接失效。
-	// 这条不是可选项，漏掉就会出现"第一次能弹、之后就永远打不开"。
+	// MSDN 的托盘示例在 TrackPopupMenu 之后都会补一条 WM_NULL，
+	// 作用是让菜单管理器知道"菜单这一轮结束了"。漏掉的话菜单状态
+	// 可能残留在 shell 里，下一次右键直接失效。
 	cmd := trackPopupMenu(menu, tpmRightButton|tpmReturnCmd|tpmNonotify, pt.X, pt.Y, t.hwnd)
 	postMessage(t.hwnd, wmNull, 0, 0)
 
 	if cmd != 0 {
-		t.dispatchCommand(uint32(cmd))
+		// dispatchCommand 里对耗时操作都是 go xxxAsync()，
+		// 但为了绝对安全（这条线程不是 UI 线程），整体再包一层 goroutine。
+		go t.dispatchCommand(uint32(cmd))
 	}
 }
 
@@ -488,14 +550,20 @@ func (t *TrayApp) dispatchCommand(cmd uint32) {
 // 就能在日志里直接看到"UI 线程从某一刻起不再响应"以及当时它在做什么。
 var uiHeartbeat int64
 
+// debugMsgs 为真时把每条窗口消息写进 diagLog，用于定位卡死点。
+// 由环境变量 DSH_TRAY_DEBUG=1 开启，平时零开销。
+var debugMsgs = os.Getenv("DSH_TRAY_DEBUG") == "1"
+
 // startWatchdog 起一个后台 goroutine 监控 UI 线程心跳。
 //
-// 卡死超过 10 秒就把诊断信息写进日志（含最后一次的 phase），
-// 这样用户在反馈"右键打不开"时，日志能直接指出卡在哪一步。
+// 卡死超过 10 秒就把**所有 goroutine 的调用栈**写进日志。
+// 这是唯一能在现场定位死锁的手段 —— 光靠猜"可能是哪个调用"效率太低，
+// 实测靠这个直接看到了卡在哪一行。
 func (t *TrayApp) startWatchdog() {
 	go func() {
 		last := atomic.LoadInt64(&uiHeartbeat)
 		lastChange := time.Now()
+		dumped := false
 		for {
 			time.Sleep(2 * time.Second)
 			if t.exiting {
@@ -505,15 +573,26 @@ func (t *TrayApp) startWatchdog() {
 			if cur != last {
 				last = cur
 				lastChange = time.Now()
+				dumped = false // 恢复了，下次卡死可以再 dump
 				continue
 			}
 			stuck := time.Since(lastChange)
-			if stuck >= 10*time.Second && stuck < 12*time.Second {
-				// 只在刚超过阈值时记一次，避免刷屏
-				diagLog("看门狗: UI 线程已停滞 %d 秒，heartbeat=%d", int(stuck.Seconds()), cur)
+			if stuck >= 10*time.Second && !dumped {
+				dumped = true
+				diagLog("看门狗: UI 线程已停滞 %d 秒（heartbeat=%d）。dump 全部 goroutine 栈：",
+					int(stuck.Seconds()), cur)
+				diagLog("=== goroutine dump begin ===\n%s\n=== goroutine dump end ===",
+					dumpAllGoroutines())
 			}
 		}
 	}()
+}
+
+// dumpAllGoroutines 返回所有 goroutine 的调用栈文本。
+func dumpAllGoroutines() string {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	return string(buf[:n])
 }
 
 // ------------------------------------------------------------------ 状态
@@ -533,7 +612,11 @@ func (t *TrayApp) setText(text string) {
 	if len(text) > 63 {
 		text = truncateBytes(text, 63)
 	}
-	nidMu.Lock()
+	// TryLock：拿不到就跳过。图标文字晚 3 秒更新完全无所谓，
+	// 但**在 UI 线程上等锁会直接冻结整个托盘** —— 那才是致命问题。
+	if !nidMu.TryLock() {
+		return
+	}
 	t.nid.Flags = nifMessage | nifIcon | nifTip
 	copyUTF16(t.nid.Tip[:], text)
 	shellNotifyIcon(nimModify, &t.nid)
@@ -559,7 +642,9 @@ func (t *TrayApp) setIcon(h uintptr) {
 	if h == 0 {
 		return
 	}
-	nidMu.Lock()
+	if !nidMu.TryLock() {
+		return
+	}
 	t.nid.Icon = h
 	t.nid.Flags = nifMessage | nifIcon | nifTip
 	shellNotifyIcon(nimModify, &t.nid)
@@ -567,7 +652,9 @@ func (t *TrayApp) setIcon(h uintptr) {
 }
 
 func (t *TrayApp) balloon(title, text string, flags uint32) {
-	nidMu.Lock()
+	if !nidMu.TryLock() {
+		return
+	}
 	t.nid.Flags = nifInfo
 	t.nid.InfoFlags = flags
 	copyUTF16(t.nid.InfoTitle[:], title)
@@ -594,6 +681,12 @@ func (t *TrayApp) isRunning() bool {
 	return Paths.IsPortListening(t.opt.Port)
 }
 
+// refreshState 把当前状态刷到图标和提示文字上。
+//
+// **一次锁内同时改图标和文字**：原来分成 setIcon() + setText() 两次调用、
+// 各拿一次锁，中间会被别的 goroutine 插进来。虽然加了锁不会写坏数据，
+// 但会出现"图标换了一半、文字还是旧的"，而且两次锁增加了 UI 线程
+// 与 goroutine 争抢的机会。
 func (t *TrayApp) refreshState() {
 	if t.exiting {
 		return
@@ -602,13 +695,30 @@ func (t *TrayApp) refreshState() {
 	if t.busy {
 		return
 	}
+
+	var icon uintptr
+	var text string
 	if running {
-		t.setIcon(t.icons.running)
-		t.setText(fmt.Sprintf("dsh web：运行中\n端口 %d", t.opt.Port))
+		icon = t.icons.running
+		text = fmt.Sprintf("dsh web：运行中\n端口 %d", t.opt.Port)
 	} else {
-		t.setIcon(t.icons.stopped)
-		t.setText("dsh web：未运行")
+		icon = t.icons.stopped
+		text = "dsh web：未运行"
 	}
+	if len(text) > 63 {
+		text = truncateBytes(text, 63)
+	}
+
+	if !nidMu.TryLock() {
+		return
+	}
+	if icon != 0 {
+		t.nid.Icon = icon
+	}
+	t.nid.Flags = nifMessage | nifIcon | nifTip
+	copyUTF16(t.nid.Tip[:], text)
+	shellNotifyIcon(nimModify, &t.nid)
+	nidMu.Unlock()
 }
 
 // ------------------------------------------------------------------ 动作
@@ -674,6 +784,9 @@ func (t *TrayApp) openUIAsync() {
 	if !t.isRunning() {
 		t.balloon(trayTitle, "dsh web 未运行，正在启动...", niifInfo)
 		t.startAsync()
+		// startAsync 是同步的（内部 Start() 最多等 120 秒）。
+		// 它跑在 goroutine 里，不会卡 UI 线程，但这里必须重新读 t.url：
+		// 启动完成后地址才可用。
 		if fresh := t.url; fresh != "" {
 			Paths.OpenUrl(fresh)
 		} else if fresh := LastUrl(t.opt.Port); fresh != "" {

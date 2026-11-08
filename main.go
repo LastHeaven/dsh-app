@@ -16,6 +16,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 )
 
@@ -53,6 +54,25 @@ func main() {
 		diagLog("forwarded, exiting")
 		return
 	}
+
+	// **必须锁定 OS 线程，这是托盘的命门。**
+	//
+	// Win32 的窗口、定时器、消息队列全都绑定在**创建它的那个 OS 线程**上：
+	// CreateWindowExW 建窗口时记录了当时的线程，SetTimer 也把定时器挂到
+	// 那个线程的消息队列，GetMessage 只能取到**本线程**的消息。
+	//
+	// 而 Go 的 goroutine 会在 OS 线程之间自由迁移 —— 同一个 goroutine
+	// 这次跑在线程 A、下次可能跑到线程 B。一旦 CreateWindow/SetTimer 之后
+	// goroutine 被挪到别的线程，GetMessage 就在错误的线程上等消息，
+	// 结果就是：窗口建好了、图标也在、但 WM_TIMER 和托盘回调全部收不到，
+	// 表现成"托盘点了没反应、定时刷新也停了"。
+	//
+	// 实测症状很有欺骗性：进程 Responding 为 True、goroutine 栈显示卡在
+	// getMessage（正常的空闲等待），看门狗只能看到"心跳不涨"。
+	//
+	// LockOSThread 之后 main goroutine 终身绑定一条线程，窗口/定时器/消息
+	// 循环都在同一条线程上，问题消失。
+	runtime.LockOSThread()
 
 	setProcessDpiAwarenessContext(dpiAwarenessPerMonitorV2)
 
