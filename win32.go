@@ -70,6 +70,9 @@ var (
 	procTrackPopupMenu        = moduser32.NewProc("TrackPopupMenu")
 	procDestroyMenu           = moduser32.NewProc("DestroyMenu")
 	procSetForegroundWindow   = moduser32.NewProc("SetForegroundWindow")
+	procGetForegroundWindow   = moduser32.NewProc("GetForegroundWindow")
+	procSetFocus              = moduser32.NewProc("SetFocus")
+	procSendInput             = moduser32.NewProc("SendInput")
 	procGetCursorPos          = moduser32.NewProc("GetCursorPos")
 	procCreateIconFromRes     = moduser32.NewProc("CreateIconFromResourceEx")
 	procDestroyIcon           = moduser32.NewProc("DestroyIcon")
@@ -512,8 +515,55 @@ func destroyMenu(menu uintptr) {
 	procDestroyMenu.Call(menu)
 }
 
-func setForegroundWindow(hwnd uintptr) {
-	procSetForegroundWindow.Call(hwnd)
+func setForegroundWindow(hwnd uintptr) bool {
+	r, _, _ := procSetForegroundWindow.Call(hwnd)
+	return r != 0
+}
+
+// INPUT 结构体的 x64 精确布局（**必须对，否则 SendInput 整批失败**）：
+//
+//	INPUT     = type(4) + pad(4) + union(32)  = 40 字节
+//	KEYBDINPUT= wVk(2) wScan(2) dwFlags(4) time(4) dwExtraInfo(8) = 20 字节
+//
+// union 部分取最大成员 MOUSEINPUT(28) 对齐后的 32 字节。
+// 最初把 keybdInput 补到 32、INPUT 变成 56 字节，SendInput 因 cbSize
+// 不对直接返回 0 —— 模拟 ALT 完全无效，菜单还是弹不出来（实测踩到）。
+type keybdInput struct {
+	Vk    uint16
+	Scan  uint16
+	Flags uint32
+	Time  uint32
+	Extra uintptr
+}
+
+type inputStruct struct {
+	Type uint32
+	_    uint32
+	Ki   keybdInput // 24 字节（20 内容 + 4 对齐填充）
+	_    [8]byte    // 补齐 union 到 32 字节 → 整体 40 字节
+}
+
+// simulateAltKey 发一次"按下并松开 ALT"。
+//
+// 目的不是模拟按键本身，而是**解锁 SetForegroundWindow 的调用权限**：
+// 系统只在"用户最近有过输入"时才允许普通进程抢占前台窗口。
+// 托盘菜单即将弹出时发这个假按键，就能让紧随其后的 SetForegroundWindow 生效。
+//
+// MSDN 的 Shell_NotifyIcon 示例就是这么做的（发 WM_NULL 或模拟 ALT）。
+// 不发的话，菜单会显示后立刻消失 —— 用户看到的就是"右键没反应"。
+func simulateAltKey() {
+	const (
+		inputKeyboard  = 1
+		vkMenu         = 0x12 // VK_MENU (Alt)
+		keyeventfKeyup = 0x0002
+	)
+
+	inputs := [2]inputStruct{
+		{Type: inputKeyboard, Ki: keybdInput{Vk: vkMenu}},
+		{Type: inputKeyboard, Ki: keybdInput{Vk: vkMenu, Flags: keyeventfKeyup}},
+	}
+	procSendInput.Call(2, uintptr(unsafe.Pointer(&inputs[0])),
+		uintptr(unsafe.Sizeof(inputs[0])))
 }
 
 func getCursorPos(p *point) bool {

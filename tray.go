@@ -360,7 +360,13 @@ func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	return defWindowProc(hwnd, msg, wparam, lparam)
 }
 
-// showMenu 弹右键菜单。必须 SetForegroundWindow，否则点别处菜单不消失。
+// showMenu 弹右键菜单。
+//
+// 这里有个 Windows 的顽固限制：**弹菜单前必须把窗口设为前台**，
+// 否则菜单一显示就立刻被关掉（表现为"右键没反应"）。
+// 而 SetForegroundWindow 只在满足一堆条件时才真的生效 ——
+// 我们的托盘进程几乎从不满足，所以必须配一个标准的变通手法，
+// 见下面 SetForegroundWindow 前后的注释。
 func (t *TrayApp) showMenu() {
 	menu := createPopupMenu()
 	if menu == 0 {
@@ -400,7 +406,20 @@ func (t *TrayApp) showMenu() {
 
 	var pt point
 	getCursorPos(&pt)
-	setForegroundWindow(t.hwnd) // 不置前，点菜单外面菜单不会消失
+
+	// **弹菜单前必须让本窗口成为前台窗口**，否则菜单显示后立即被关掉，
+	// 表现为"右键点了没反应"。
+	//
+	// 但 SetForegroundWindow 只在系统认可"用户刚有过输入"时才生效，
+	// 否则静默返回 false。实测：dsh 窗口（或浏览器）在前台时，
+	// 直接调用 100% 失败，TrackPopupMenu 随即卡住不返回 ——
+	// 用户看到的就是右键菜单永远出不来。
+	//
+	// 标准变通手法（MSDN 的托盘示例同款）：先发一个假的 ALT 键，
+	// 让系统解锁前台切换权限，再调用 SetForegroundWindow。
+	simulateAltKey()
+	setForegroundWindow(t.hwnd)
+
 	// TPM_RETURNCMD：菜单同步返回被点的项 id（且不再发 WM_COMMAND），
 	// 直接在这里分发，省掉一次消息往返。
 	cmd := trackPopupMenu(menu, tpmRightButton|tpmReturnCmd|tpmNonotify, pt.X, pt.Y, t.hwnd)

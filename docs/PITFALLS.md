@@ -343,6 +343,44 @@ if shellNotifyIcon(nimModify, &t.nid) {
 
 另外 `NIM_ADD` 之前先 `NIM_DELETE`：图标还在时直接 ADD 会返回 E_FAIL。
 
+### 弹托盘菜单前必须用假 ALT 解锁 SetForegroundWindow
+
+**症状**：右键托盘图标没反应。不是偶发 —— 只要别的窗口在前台（浏览器、
+dsh 自己的管理界面），**100% 打不开**。
+
+**根因**：`TrackPopupMenu` 要求调用方窗口是前台窗口，否则菜单显示后
+立即被关闭。而 `SetForegroundWindow` 只在系统认可"用户刚有过输入"时
+才生效，其余情况**静默返回 false**（不报错，很难查）。
+
+实测日志：
+
+```
+showMenu: pt=(1582,1059) hwnd=590130
+SetForegroundWindow=false 当前前台=66920 (期望 590130)   ← Chrome 在前台
+（然后就卡住，TrackPopupMenu 永不返回）
+```
+
+**修法**（MSDN 托盘示例同款）：弹菜单前先发一次假的 ALT 按下+松开，
+让系统解锁前台切换权限。
+
+```go
+simulateAltKey()                  // 发 ALT down + ALT up
+setForegroundWindow(t.hwnd)       // 现在才会真的成功
+cmd := trackPopupMenu(...)        // 菜单正常弹出
+```
+
+修后日志：
+
+```
+SetForegroundWindow=true 当前前台=590130 (期望 590130)
+showMenu: TrackPopupMenu 返回 cmd=0     ← ESC 能正常取消
+```
+
+**注意 INPUT 结构体必须精确 40 字节**：`keybdInput` 20 字节内容对齐到
+24，union 补齐到 32，整体 40。写成 48 或 56 字节时 `SendInput` 会因
+`cbSize` 不对直接返回 0，模拟 ALT 完全无效 —— 而且**不报任何错误**，
+表现为"改了代码还是打不开"。这个坑实际踩过。
+
 ---
 
 ## 路径与文件
