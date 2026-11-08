@@ -446,6 +446,58 @@ go func() {
 **注意**：给 `wndProc` 加 `defer` 清空诊断字段是错的 —— 卡死时函数
 根本不返回，defer 不会执行，反而误以为"信息被抹掉了"。
 
+### 指针不能"裸奔"进 syscall.Call（GC 会回收它）
+
+错误写法：
+
+```go
+procAppendMenuW.Call(menu, flags, id, uintptr(unsafe.Pointer(utf16Ptr(text))))
+```
+
+问题：那个 `*uint16` **没有任何 Go 变量持有**，只有 `uintptr` 形式的地址
+被传进 syscall。**Go 的 GC 只扫描栈上的指针，`uintptr` 不算指针** ——
+一旦在 `Call` 期间发生 GC，这块 UTF-16 缓冲会被回收，Win32 拿到野指针。
+
+**这是未定义行为，不会立刻报错**。实测 `AppendMenuW` 照样返回 1
+（成功），但菜单内容可能损坏、或者调用挂起。症状是"时灵时不灵"，
+极难复现和排查。
+
+正确写法：
+
+```go
+p := utf16Ptr(text)
+if p == nil {
+	return
+}
+procAppendMenuW.Call(menu, uintptr(flags), id, uintptr(unsafe.Pointer(p)))
+runtime.KeepAlive(p)   // 保证活到 Call 结束
+```
+
+`createMutexW`、`messageBox`、`shellExecuteOpen` 里都有同样的写法，
+已全部修掉。
+
+**自查方法**：搜 `unsafe.Pointer(utf16Ptr(`，凡是直接嵌在 `Call(...)`
+参数里的都要改。
+
+### MF_SEPARATOR 项的 lpNewItem 必须是 NULL
+
+```go
+appendMenu(menu, mfSeparator, 0, "")   // 错：utf16Ptr("") 是 "\0" 的地址
+appendMenu(menu, mfSeparator, 0, "")   // 对：内部判到 separator 就传 0
+```
+
+对分隔符项，`AppendMenuW` 不读文本参数。传空字符串指针（不是 NULL）
+是未定义行为。实测不报错，但可能让菜单构建出异常状态。
+
+现在 `appendMenu` 里统一处理：
+
+```go
+if flags&mfSeparator != 0 || text == "" {
+	procAppendMenuW.Call(menu, uintptr(flags), id, 0)
+	return
+}
+```
+
 ### 托盘必须 runtime.LockOSThread，否则消息循环收不到消息
 
 **这是整个项目最隐蔽的 bug，排查了两轮才定位。**

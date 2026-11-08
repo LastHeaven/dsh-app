@@ -404,61 +404,37 @@ func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 
 // showMenu 弹右键菜单。
 //
-// **本函数绝不能直接调用 trackPopupMenu。**
+// **必须在 UI 线程上同步调用 TrackPopupMenu。**
 //
-// TrackPopupMenu 是同步阻塞的 —— 它内部会跑一个消息泵，等用户点选。
-// 如果直接在 wndProc（Go 的回调，syscall.NewCallback）里调它，
-// TrackPopupMenu 的消息泵会**重入 wndProc**，形成 Go 回调嵌套。
-// Go 运行时不支持这种嵌套，结果就是整个消息循环死锁：
-// 进程还活着、Responding 仍是 True，但再也不处理任何消息。
-// 实测：右键或左键点击后必现，连 ESC 和鼠标点击都无法唤醒。
+// 试过把它丢到独立线程/goroutine 弹，结果 TrackPopupMenu 立刻返回 0、
+// 菜单根本不显示 —— 它要求调用线程就是拥有前台窗口的那条线程，
+// 换到别的线程 Windows 直接拒绝（返回 0，不报错）。
 //
-// 正确做法：另起一个**原生线程**专门弹菜单，UI 线程只负责
-// 把自己设为前台窗口然后立刻返回。菜单线程阻塞不影响消息循环。
+// 同步阻塞是安全的：TrackPopupMenu 内部的消息泵会重入 wndProc，
+// Go 的 syscall.NewCallback 支持这种重入（栈会增长）。真正需要避免的是
+// **在别的线程弹**，以及**在 wndProc 里做别的耗时操作**。
 //
-// 这里用 CreateThread 而不是 Go 的 goroutine：goroutine 最终要落在
-// 某个 OS 线程上，而 Go 可能把它调度到正在跑 wndProc 的那个线程，
-// 问题依旧。CreateThread 拿到的是一条干净的原生线程。
+// 前置条件：窗口必须是前台窗口，否则菜单显示后立刻被关掉。
+// SetForegroundWindow 只在系统认可"用户刚有过输入"时才生效，
+// 所以先发一个假的 ALT 键解锁——见 simulateAltKey 的注释。
 func (t *TrayApp) showMenu() {
+	defer func() {
+		if r := recover(); r != nil {
+			diagLog("showMenu: PANIC %v", r)
+			buf := make([]byte, 8192)
+			n := runtime.Stack(buf, false)
+			diagLog("showMenu: stack\n%s", string(buf[:n]))
+		}
+	}()
 	var pt point
 	getCursorPos(&pt)
 
-	// 前台切换必须在 UI 线程做（有线程亲和性），且要尽快返回。
-	// SetForegroundWindow 只在系统认可"用户刚有过输入"时生效，
-	// 所以先发一个假的 ALT 键解锁前台切换权限。
 	simulateAltKey()
 	setForegroundWindow(t.hwnd)
 
-	// 菜单构建 + TrackPopupMenu 全部交给独立线程
-	go popupMenuOnOwnThread(t, pt)
-}
-
-// popupMenuOnOwnThread 在独立的原生线程上弹菜单。
-func popupMenuOnOwnThread(t *TrayApp, pt point) {
-	// 用 CreateThread 拿一条干净的原生线程；Go 的 goroutine 可能被
-	// 调度回正在跑 wndProc 的线程，那样等于没解决重入问题。
-	done := make(chan struct{})
-	cb := syscall.NewCallback(func(_ uintptr) uintptr {
-		t.buildAndTrackMenu(pt)
-		close(done)
-		return 0
-	})
-	h, _, _ := procCreateThread.Call(0, 0, cb, 0, 0, 0)
-	if h == 0 {
-		// 建线程失败就退化成当前线程弹（可能重入，但总比不弹好）
-		diagLog("showMenu: CreateThread 失败，退化到当前线程")
-		t.buildAndTrackMenu(pt)
-		return
-	}
-	closeHandle(h)
-	<-done
-}
-
-// buildAndTrackMenu 构建菜单并阻塞等待用户选择。
-// 在专用线程上运行，阻塞是安全的。
-func (t *TrayApp) buildAndTrackMenu(pt point) {
 	menu := createPopupMenu()
 	if menu == 0 {
+		diagLog("showMenu: CreatePopupMenu 失败")
 		return
 	}
 	defer destroyMenu(menu)
@@ -493,19 +469,17 @@ func (t *TrayApp) buildAndTrackMenu(pt point) {
 
 	appendMenu(menu, mfString, cmdExit, "退出")
 
-	// 坐标由调用方（UI 线程）取好传进来：菜单线程上取到的光标位置
-	// 可能已经变了（用户把鼠标移开了）。
-	//
-	// MSDN 的托盘示例在 TrackPopupMenu 之后都会补一条 WM_NULL，
-	// 作用是让菜单管理器知道"菜单这一轮结束了"。漏掉的话菜单状态
-	// 可能残留在 shell 里，下一次右键直接失效。
+	// TPM_RETURNCMD：菜单同步返回被点的项 id（且不再发 WM_COMMAND），
+	// 直接在这里分发，省掉一次消息往返。
 	cmd := trackPopupMenu(menu, tpmRightButton|tpmReturnCmd|tpmNonotify, pt.X, pt.Y, t.hwnd)
+
+	// MSDN 的托盘示例在 TrackPopupMenu 之后都会补一条 WM_NULL，
+	// 让菜单管理器知道"这一轮结束了"。漏掉的话菜单状态可能残留在
+	// shell 里，下一次右键直接失效。
 	postMessage(t.hwnd, wmNull, 0, 0)
 
 	if cmd != 0 {
-		// dispatchCommand 里对耗时操作都是 go xxxAsync()，
-		// 但为了绝对安全（这条线程不是 UI 线程），整体再包一层 goroutine。
-		go t.dispatchCommand(uint32(cmd))
+		t.dispatchCommand(uint32(cmd))
 	}
 }
 

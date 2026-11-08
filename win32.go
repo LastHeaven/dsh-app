@@ -7,6 +7,8 @@
 package main
 
 import (
+	"errors"
+	"runtime"
 	"syscall"
 	"unsafe"
 )
@@ -388,7 +390,12 @@ func createMutexW(name string, initialOwner bool) (uintptr, bool, error) {
 	if initialOwner {
 		owner = 1
 	}
-	r, _, err := procCreateMutexW.Call(0, owner, uintptr(unsafe.Pointer(utf16Ptr(name))))
+	np := utf16Ptr(name)
+	if np == nil {
+		return 0, false, errors.New("bad mutex name")
+	}
+	r, _, err := procCreateMutexW.Call(0, owner, uintptr(unsafe.Pointer(np)))
+	runtime.KeepAlive(np)
 	if r == 0 {
 		return 0, false, err
 	}
@@ -502,8 +509,36 @@ func createPopupMenu() uintptr {
 	return r
 }
 
+// appendMenu 往菜单里加一项。
+//
+// 两个坑，都实测踩过：
+//
+// **1. 分隔符的 lpNewItem 必须是 NULL。**
+// 对 MF_SEPARATOR 项，AppendMenuW 不读文本参数。传一个空字符串指针进去
+// （utf16Ptr("") 得到的是 "\0" 的地址，不是 NULL），AppendMenuW 会试图
+// 把它当文本处理，行为未定义 —— 实测第二项（第一个分隔符）直接卡死，
+// 整个消息循环停摆，托盘从此不响应。
+//
+// **2. 指针不能裸奔进 Call。**
+// 原实现写成
+//
+//	procAppendMenuW.Call(menu, flags, id, uintptr(unsafe.Pointer(utf16Ptr(text))))
+//
+// 那个 *uint16 没有任何 Go 变量持有，只有 uintptr 形式的地址被传进 syscall。
+// Go 的 GC 只扫描栈上的指针，**uintptr 不算指针** —— 一旦在 Call 期间
+// 发生 GC，这块 UTF-16 缓冲会被回收，AppendMenuW 拿到野指针。
 func appendMenu(menu uintptr, flags uint32, id uintptr, text string) {
-	procAppendMenuW.Call(menu, uintptr(flags), id, uintptr(unsafe.Pointer(utf16Ptr(text))))
+	// 分隔符（以及任何不需要文本的项）必须传 NULL。
+	if flags&mfSeparator != 0 || text == "" {
+		procAppendMenuW.Call(menu, uintptr(flags), id, 0)
+		return
+	}
+	p := utf16Ptr(text)
+	if p == nil {
+		return
+	}
+	procAppendMenuW.Call(menu, uintptr(flags), id, uintptr(unsafe.Pointer(p)))
+	runtime.KeepAlive(p)
 }
 
 func trackPopupMenu(menu uintptr, flags uint32, x, y int32, hwnd uintptr) uint32 {
@@ -578,10 +613,14 @@ func getCursorPos(p *point) bool {
 }
 
 func messageBox(hwnd uintptr, text, caption string, flags uint32) int32 {
+	// 同样不能让指针裸奔进 Call，见 appendMenu 的说明。
+	tp, cp := utf16Ptr(text), utf16Ptr(caption)
 	r, _, _ := procMessageBoxW.Call(hwnd,
-		uintptr(unsafe.Pointer(utf16Ptr(text))),
-		uintptr(unsafe.Pointer(utf16Ptr(caption))),
+		uintptr(unsafe.Pointer(tp)),
+		uintptr(unsafe.Pointer(cp)),
 		uintptr(flags))
+	runtime.KeepAlive(tp)
+	runtime.KeepAlive(cp)
 	return int32(r)
 }
 
@@ -642,5 +681,7 @@ func shellExecuteOpen(target string) bool {
 		uintptr(unsafe.Pointer(file)),
 		0, 0, // 无参数、无工作目录
 		swShownormal) // SW_SHOWNORMAL
+	runtime.KeepAlive(verb)
+	runtime.KeepAlive(file)
 	return r > 32
 }
