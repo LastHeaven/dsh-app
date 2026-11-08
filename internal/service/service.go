@@ -220,6 +220,20 @@ func (c *captureWriter) String() string {
 	return c.sb.String()
 }
 
+// 启动超时。
+//
+// 实测 dsh web 启动约 8 秒，原来的 120 秒上限基本不会触发；但一旦 node
+// 卡在某个环节，用户会看到菜单里"正在启动"挂两分半，期间再点也没反应
+// （busy 挡着，updateLoop 也会被一起挡住）。60 秒已经给了 7 倍余量。
+//
+// 命令行路径（-Headless / -Update）保留更长的余量：那条路径没有托盘、
+// 用户就在等着看结果，卡住时能多等一会儿比提前失败更有用。
+const (
+	startURLTimeout    = 60 * time.Second  // 托盘：等 dsh 打印带 token 的地址
+	startURLTimeoutCLI = 120 * time.Second // 命令行：同上，但给足余量
+	startPortTimeout   = 30 * time.Second  // 等端口真的 LISTEN
+)
+
 // Start 后台拉起 dsh web，返回带 token 的访问地址。
 func Start(opt *config.Options) (string, error) {
 	// 只有目标端口确实被占着时才停那一个实例，不影响其它端口
@@ -285,7 +299,11 @@ func Start(opt *config.Options) (string, error) {
 
 	// dsh web 启动时会打印带 token 的访问地址，从这里抓
 	var url string
-	deadline = time.Now().Add(120 * time.Second)
+	urlTimeout := startURLTimeout
+	if opt.Headless || opt.DryRun || opt.StopOnly || opt.UpdateTo != "" {
+		urlTimeout = startURLTimeoutCLI
+	}
+	deadline = time.Now().Add(urlTimeout)
 	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -325,7 +343,7 @@ waitLoop:
 	}
 
 	// 等端口真的起来
-	deadline = time.Now().Add(30 * time.Second)
+	deadline = time.Now().Add(startPortTimeout)
 	for time.Now().Before(deadline) && !paths.IsPortListening(opt.Port) {
 		time.Sleep(300 * time.Millisecond)
 	}

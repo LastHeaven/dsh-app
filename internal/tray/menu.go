@@ -68,16 +68,22 @@ func (t *App) showMenu() {
 
 	// 更新区：有新版才出现「更新到 vX.Y.Z」，检查更新常驻。
 	// 升级进行中把两项都置灰，防止重复点。
-	if t.upd.HasUpdate {
-		label := "更新到 " + t.upd.Latest
+	//
+	// 这里跑在 UI 线程上，**只做一次快照**：getUpdateState 取一次、
+	// updating 取一次，不要在 AppendMenu 之间反复读，否则菜单项的前后状态
+	// 可能来自不同时刻（虽然无害，但会让"置灰"看起来随机）。
+	upd := t.getUpdateState()
+	updating := t.updating.Load()
+	if upd.HasUpdate {
+		label := "更新到 " + upd.Latest
 		flags := uint32(win32.MFString)
-		if t.updating {
+		if updating {
 			flags |= win32.MFGrayed
 		}
 		win32.AppendMenu(menu, flags, cmdApplyUpdate, label)
 	}
 	checkFlags := uint32(win32.MFString)
-	if t.updating {
+	if updating {
 		checkFlags |= win32.MFGrayed
 	}
 	win32.AppendMenu(menu, checkFlags, cmdCheckUpdate, "检查更新")
@@ -112,7 +118,7 @@ func (t *App) dispatchCommand(cmd uint32) {
 	case cmdRestart:
 		go t.restartAsync()
 	case cmdOpenURL:
-		u := t.url
+		u := t.getURL()
 		if u == "" {
 			u = service.LastURL(t.opt.Port)
 		}

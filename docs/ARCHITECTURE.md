@@ -147,6 +147,39 @@ main()
 `PostMessage(WM_CLOSE)` 绕回主线程收尾，详见
 [PITFALLS.md](PITFALLS.md#退出托盘要顺手停掉它管的服务)。
 
+## 托盘状态与并发
+
+`App` 的字段按并发方式分三类，**加字段前先决定它属于哪一类**：
+
+| 类别 | 字段 | 同步手段 |
+| --- | --- | --- |
+| 仅 UI 线程 | `hwnd`、`nid`、`icons`、`taskbarCreatedMsg` | `nid` 另受 `nidMu` 保护（UI 线程只用 `TryLock`） |
+| 跨 goroutine 的布尔标志 | `busy`、`exiting`、`updating` | `atomic.Bool`，进状态用 `CompareAndSwap` |
+| 普通共享数据 | `url`、`upd`、`notifiedV`、`wasRunning` | `stateMu sync.RWMutex` |
+
+**为什么 `busy` 必须是原子 CAS**：菜单、管道转发、`openUIAsync` 三条路径
+都会调 `startAsync`。先查后置的写法会让两个 goroutine 同时通过
+`if busy` 检查、各自跑一遍 `Start()`，两个 node 抢同一个端口。
+这是 `-race` 可复现的真实竞争，不是理论风险。
+
+访问一律走访问器（`markBusy`/`isBusy`/`getURL`/`setUpdateState`/`noteNotified`…），
+不要直接碰字段 —— 字段本身已不导出到这层之外能随手改的形态，
+写错会在编译期被挡住。
+
+**注意 `stateMu` 与 `nidMu` 是两把不同的锁，不能合并**：`nidMu` 有一条硬约定
+"UI 线程绝不阻塞等锁"，混进普通读写会把那条纪律破坏掉。
+
+## 关机/注销时的收尾
+
+`wndProc` 处理 `WM_QUERYENDSESSION` 和 `WM_ENDSESSION`：收到就投一个
+`go exit()`，让正常退出流程（含 `Stop()`）跑起来。
+
+- 消息处理本身**必须极轻**：不能同步 `Stop()`，那会把关机拖住，
+  系统可能直接强杀。
+- `WM_QUERYENDSESSION` 返回 **0**（不阻止关机）。不能返回 1 ——
+  那是"我正在保存数据请等我"，我们等的却是外部进程退出，处理不好会让关机卡几分钟。
+- `exit()` 内部有 `beginExit()` 的 CAS，两条消息 + 菜单退出重复触达都安全。
+
 ## 单实例机制
 
 - 互斥体名 `Global\dsh-web-tray-{7E2F5C41-...}`，**和旧 C# 版一致**，
@@ -163,10 +196,20 @@ main()
 | --- | --- | --- |
 | 运行中 | 端口 LISTEN | 黑鲸鱼 `#0B0B0F` |
 | 未运行 | 端口没 LISTEN | 灰鲸鱼 `#9AA0AE` |
-| 忙碌 | `busy` 标志为真（启停进行中） | 琥珀 `#D99B00` |
+| 忙碌 | `busy` 为真（启停/升级进行中） | 琥珀 `#D99B00` |
 
 轮询每 3 秒一次。`wasRunning` 用于检测"意外退出"并弹气泡提示；
 手动停止时把 `wasRunning` 置 false，避免误报。
+
+## 启动超时
+
+| 场景 | 等地址 | 说明 |
+| --- | --- | --- |
+| 托盘 | 60 秒 | 实测启动约 8 秒，60 秒是 7 倍余量 |
+| 命令行（`-Headless`/`-Update`） | 120 秒 | 没有托盘、用户在等结果，多等一会儿比提前失败有用 |
+
+等端口 LISTEN 另算 30 秒。原来托盘也用 120 秒，但一旦 node 卡住，
+菜单里"正在启动"会挂两分半、期间再点也没反应（`busy` 挡着），体验很差。
 
 ## 资源与图标
 

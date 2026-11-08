@@ -8,8 +8,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 
 产物 `publish\dsh-web.exe`，约 **3.1 MB**。
 
-脚本流程：gofmt → windres 生成 `app.syso` → `go vet`（必须 0 告警）→
+脚本流程：gofmt → 校验 `.ps1` 的 UTF-8 BOM → windres 生成
+`cmd\dsh-web\app.syso` → `go vet`（必须 0 告警）→ `go test` →
 `go build -ldflags "-s -w -H windowsgui"` → 校验 manifest 和版本信息是否嵌入。
+
+## 并发改动必须跑 `-race`
+
+托盘的 `App` 有多个 goroutine 读写同一批字段，普通 `go test` 看不出问题。
+改过 `internal/tray/` 或任何跨 goroutine 的状态后：
+
+```powershell
+$env:CGO_ENABLED='1'
+go test -race ./...
+$env:CGO_ENABLED='0'
+```
+
+`-race` **需要 CGO**（要链接 race runtime），所以跑完记得把
+`CGO_ENABLED` 调回 0，否则 `build.ps1` 的静态编译会失败。
+
+注意：`-race` 只跑现有测试。如果测试本身没覆盖并发路径，它绿得再好看也没意义 ——
+`internal/tray/state_test.go` 里那几个「一个 goroutine 读、一个 goroutine 写」
+的用例就是为此存在的，加新的共享状态时要照着补。
 
 ## 发版
 
@@ -200,6 +219,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build\icons\build-icons.ps1
 
 - [ ] `go vet` 0 告警
 - [ ] `go test ./...` 全过
+- [ ] 改过并发相关代码时，`go test -race ./...` 也全过
 - [ ] `-DryRun` 能识别到运行中的实例
 - [ ] `-Help` 中文不乱码
 - [ ] `-CheckUpdate` 能正确报告版本

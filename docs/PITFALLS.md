@@ -141,6 +141,54 @@ Go 会按 MS 转义规则把参数拼成命令行，而 `explorer.exe` 对引号
 
 ---
 
+## 并发与共享状态
+
+### `busy` 先查后置会导致"双启动"
+
+`App.busy` 曾经是普通 `bool`，`startAsync` 里的写法是：
+
+```go
+if t.busy { return }
+t.busy = true
+```
+
+而 `startAsync` 会被**三条路径并发调用**：菜单点击、命名管道转发
+（第二实例把命令交给主实例）、`openUIAsync` 里的自动启动。
+两个 goroutine 可以同时通过 `if t.busy` 检查，然后各自跑一遍
+`service.Start()` —— 两个 node 进程抢同一个端口，其中一个必然失败，
+用户看到的是"启动失败"或者莫名其妙的端口占用。
+
+**修法**：改 `atomic.Bool`，进状态必须用 CAS：
+
+```go
+func (t *App) markBusy() bool { return t.busy.CompareAndSwap(false, true) }
+
+// 调用方：
+if !t.markBusy() { return }   // 拿不到就直接放弃
+defer ...
+```
+
+**配套纪律**：谁 CAS 成功，谁才有资格 `clearBusy()`。曾经在
+`applyUpdateAsync` 里写成"抢不到也继续跑、最后无条件 clear"，
+那会把 `startAsync` 持有的 busy 提前清掉，`refreshState` 就会在
+服务还没起来时把图标刷成"未运行"。用 `ownsBusy := t.markBusy()` 记住归属。
+
+### 共享状态不要复用 `nidMu`
+
+`nidMu` 有一条硬约定：**UI 线程只用 `TryLock`，绝不阻塞等锁**
+（否则消息循环停摆，表现为"右键点不动"）。把普通读写塞进这把锁，
+会诱使后来的代码在 UI 线程上等它，那条纪律就废了。
+`url`/`upd`/`notifiedV`/`wasRunning` 单独用 `stateMu sync.RWMutex`。
+
+### 用 `-race` 验证，不要靠看
+
+托盘测试原本只覆盖图标加载和字符串截断，`-race` 跑得再绿也说明不了问题。
+要专门写一个「一个 goroutine 读、一个 goroutine 写」的探针才复现得出来。
+现在 `internal/tray/state_test.go` 里这几个用例就是这个作用，改并发代码后
+**必须跑 `go test -race ./...`**。
+
+---
+
 ## 图标
 
 ### `CreateIconFromResourceEx` 在这台机器上不可用

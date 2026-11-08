@@ -20,7 +20,7 @@ func (t *App) updateLoop() {
 	}
 
 	for {
-		if t.exiting {
+		if t.isExiting() {
 			return
 		}
 		st := updater.Check()
@@ -31,7 +31,7 @@ func (t *App) updateLoop() {
 			updater.Log("检查更新：当前 %s，最新 %s，有更新=%v",
 				st.Current, st.Latest, st.HasUpdate)
 		}
-		t.upd = st
+		t.setUpdateState(st)
 		// 回窗口线程：菜单和气泡都必须由创建窗口的线程改
 		win32.PostMessage(t.hwnd, win32.WMUpdateReady, 0, 0)
 
@@ -45,15 +45,20 @@ func (t *App) updateLoop() {
 
 // onUpdateReady 在 UI 线程处理检查结果（由 WMUpdateReady 触发）。
 func (t *App) onUpdateReady() {
-	if t.exiting || !t.upd.HasUpdate {
+	if t.isExiting() {
 		return
 	}
-	// 同一个版本只提示一次，别每 6 小时骚扰
-	if t.notifiedV == t.upd.Latest {
+	upd := t.getUpdateState()
+	if !upd.HasUpdate {
 		return
 	}
-	t.notifiedV = t.upd.Latest
-	t.balloon(title, "dsh 有新版本 "+t.upd.Latest+"，右键图标可更新。", win32.NIIFInfo)
+	// 同一个版本只提示一次，别每 6 小时骚扰。
+	// noteNotified 内部做"比较并记录"的原子操作，避免两个来源
+	// （定时检查 + 手动检查）同时判定需要提示而弹两次气泡。
+	if !t.noteNotified(upd.Latest) {
+		return
+	}
+	t.balloon(title, "dsh 有新版本 "+upd.Latest+"，右键图标可更新。", win32.NIIFInfo)
 }
 
 // HandleForwarded 处理第二个实例转交过来的命令。

@@ -11,7 +11,8 @@ const (
 	ProcessCommandLineInformation = 60
 
 	// 窗口消息
-	WMQueryEndSession = 0x0011 // 预留：关机时的收尾
+	WMQueryEndSession = 0x0011
+	WMEndSession      = 0x0016
 	WMDestroy         = 0x0002
 	WMClose           = 0x0010
 	WMRButtonUp       = 0x0205

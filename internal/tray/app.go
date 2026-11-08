@@ -127,7 +127,7 @@ func copyUTF16(dst []uint16, s string) {
 // 这台机器上 TrayNotifyWnd 不存在，GetRect 恒失败，会把成功的 ADD
 // 误判成失败（实测踩过，导致每 10 秒重建一次的死循环）。
 func (t *App) reAddIcon(reason string) bool {
-	if t.exiting || t.hwnd == 0 {
+	if t.isExiting() || t.hwnd == 0 {
 		return false
 	}
 
@@ -178,7 +178,7 @@ func (t *App) reAddIcon(reason string) bool {
 // 用户看到的就是"右键点不动、左键也没反应"。
 // 所以这里用 TryLock：拿不到就直接跳过这一轮，10 秒后再试即可。
 func (t *App) checkIconAlive() {
-	if t.exiting || t.hwnd == 0 {
+	if t.isExiting() || t.hwnd == 0 {
 		return
 	}
 	if !nidMu.TryLock() {
@@ -268,6 +268,31 @@ func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		// 退出路径的收尾：把窗口销毁掉（随后会收到 WM_DESTROY → 退出消息循环）。
 		// 必须在本线程做，所以 exit() 用 PostMessage(WM_CLOSE) 绕回这里。
 		win32.DestroyWindow(hwnd)
+		return 0
+
+	case win32.WMQueryEndSession:
+		// 关机/注销/重启前系统会发这条消息（**广播给所有顶层窗口**）。
+		//
+		// 不处理的话进程被直接结束，exit() 里的 Stop() 根本没机会跑，
+		// 3080 上的 node 会变成孤儿继续占着端口。虽然下次启动时
+		// Start() 会先停掉旧实例、不会真的出问题，但关机流程不该留这个东西。
+		//
+		// **这里要做的事很轻**：只投一个 WM_CLOSE 让正常退出流程跑起来，
+		// 真正的 Stop 在 goroutine 里（exit() 最多等 20 秒）。
+		// 不能在 wndProc 里同步 Stop —— 那会拖住整个关机，系统可能直接强杀。
+		//
+		// 返回 0 表示"不阻止关机"。不能返回 1：那等于告诉系统
+		// "我正在保存数据，请等我"，我们等的却是外部进程退出，
+		// 处理不好会让关机卡住好几分钟。
+		Diag("收到 WM_QUERYENDSESSION，触发退出流程")
+		go current.exit()
+		return 0
+
+	case win32.WMEndSession:
+		// 会话正在结束（这次是真的要关/注销了）。此时能做的只有尽快收尾。
+		// exit() 内部有 beginExit 的 CAS，重复触达是安全的。
+		Diag("收到 WM_ENDSESSION，收尾")
+		go current.exit()
 		return 0
 
 	case win32.WMDestroy:

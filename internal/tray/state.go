@@ -80,15 +80,18 @@ func (t *App) balloon(titleText, text string, flags uint32) {
 
 // refreshStateAsync 轮询状态（每 3 秒）。
 func (t *App) refreshStateAsync() {
-	if t.exiting {
+	if t.isExiting() {
 		return
 	}
 	t.refreshState()
 
-	if t.wasRunning && !t.isRunning() && !t.busy && !t.exiting {
+	// 读 wasRunning、算 isRunning、再写回：跨了多次状态访问，
+	// 中间可能被别的 goroutine 改，但这里只是"要不要弹一次气泡"，
+	// 用一次快照判断即可，不需要原子性。
+	if t.getWasRunning() && !t.isRunning() && !t.isBusy() && !t.isExiting() {
 		t.balloon(title, "dsh web 已退出。右键图标可重新启动。", win32.NIIFWarning)
 	}
-	t.wasRunning = t.isRunning()
+	t.setWasRunning(t.isRunning())
 }
 
 func (t *App) isRunning() bool {
@@ -102,11 +105,11 @@ func (t *App) isRunning() bool {
 // 但会出现"图标换了一半、文字还是旧的"，而且两次锁增加了 UI 线程
 // 与 goroutine 争抢的机会。
 func (t *App) refreshState() {
-	if t.exiting {
+	if t.isExiting() {
 		return
 	}
 	running := t.isRunning()
-	if t.busy {
+	if t.isBusy() {
 		return
 	}
 

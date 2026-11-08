@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/LastHeaven/dsh-app/internal/win32"
@@ -28,7 +29,25 @@ import (
 //
 // 唯一保留的兜底：exe 所在目录不可写时（比如放在 Program Files）才退到
 // D:\agents\dsh，避免日志静默写失败。
+//
+// **结果必须缓存**：每次调用都要 os.Executable + CreateTemp + Remove 探测可写性，
+// 实测单次 384µs。而 LogDir/OutLog/ErrLog/UrlFile 全部走 Root，
+// 一次「写更新日志」就会探测 2~3 次。托盘每 3 秒刷新状态时也会写日志，
+// 等于常驻进程在不停地建删临时文件 —— 这正是杀软实时防护最敏感的行为特征。
+//
+// 进程生命周期内 exe 所在目录不会变，所以缓存一次是安全的。
 func Root() string {
+	rootOnce.Do(func() { rootPath = resolveRoot() })
+	return rootPath
+}
+
+var (
+	rootOnce sync.Once
+	rootPath string
+)
+
+// resolveRoot 是 Root 的未缓存实现。
+func resolveRoot() string {
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
 		if wd, e := os.Getwd(); e == nil {

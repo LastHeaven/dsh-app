@@ -28,7 +28,7 @@ func (t *App) startWatchdog() {
 		dumped := false
 		for {
 			time.Sleep(2 * time.Second)
-			if t.exiting {
+			if t.isExiting() {
 				return
 			}
 			cur := atomic.LoadInt64(&uiHeartbeat)
@@ -59,37 +59,40 @@ func dumpAllGoroutines() string {
 
 // ---------------------------------------------------------------- 动作
 
+// startAsync 启动服务。
+//
+// **必须用 markBusy 的 CAS 占位**：本函数被菜单、管道转发、openUIAsync
+// 三条路径并发调用，先查后置会让两个 goroutine 同时通过检查、各自跑一遍
+// Start()，两个 node 抢同一个端口。
 func (t *App) startAsync() {
-	if t.busy {
+	if !t.markBusy() {
 		return
 	}
-	t.busy = true
 	t.setIcon(t.icons.busy)
 	t.setText("dsh web：正在启动...")
 
 	url, err := service.Start(t.opt)
 	if err != nil {
-		t.url = ""
+		t.setURL("")
 		t.balloon(title, "启动失败："+err.Error(), win32.NIIFError)
 	} else {
-		t.url = url
+		t.setURL(url)
 	}
-	t.busy = false
+	t.clearBusy()
 	t.refreshState()
 }
 
 func (t *App) stopAsync() {
-	if t.busy {
+	if !t.markBusy() {
 		return
 	}
-	t.busy = true
 	t.setIcon(t.icons.busy)
 	t.setText("dsh web：正在停止...")
 
 	n := service.Stop(t.opt.Port)
-	t.url = ""
-	t.busy = false
-	t.wasRunning = false // 手动停止，别再当成意外退出提示一次
+	t.setURL("")
+	t.clearBusy()
+	t.setWasRunning(false) // 手动停止，别再当成意外退出提示一次
 	t.refreshState()
 
 	if n > 0 {
@@ -106,7 +109,7 @@ func (t *App) restartAsync() {
 
 func (t *App) openUIAsync() {
 	// 只认本端口的地址，历史遗留的别的端口要忽略
-	u := t.url
+	u := t.getURL()
 	if u == "" {
 		u = service.LastURL(t.opt.Port)
 	}
@@ -119,9 +122,9 @@ func (t *App) openUIAsync() {
 		t.balloon(title, "dsh web 未运行，正在启动...", win32.NIIFInfo)
 		t.startAsync()
 		// startAsync 是同步的（内部 Start() 最多等 120 秒）。
-		// 它跑在 goroutine 里，不会卡 UI 线程，但这里必须重新读 t.url：
+		// 它跑在 goroutine 里，不会卡 UI 线程，但这里必须重新读地址：
 		// 启动完成后地址才可用。
-		if fresh := t.url; fresh != "" {
+		if fresh := t.getURL(); fresh != "" {
 			paths.OpenURL(fresh)
 		} else if fresh := service.LastURL(t.opt.Port); fresh != "" {
 			paths.OpenURL(fresh)
@@ -132,14 +135,19 @@ func (t *App) openUIAsync() {
 }
 
 // checkUpdateAsync 手动检查一次更新（菜单点击/转交命令）。
+//
+// updating 用 CAS 占位：菜单连点和管道转发可能同时进来，
+// 两个并发的 registry 请求既浪费又会让气泡互相覆盖。
 func (t *App) checkUpdateAsync() {
-	if t.updating {
+	if !t.updating.CompareAndSwap(false, true) {
 		return
 	}
+	defer t.updating.Store(false)
+
 	t.balloon(title, "正在检查更新...", win32.NIIFInfo)
 
 	st := updater.Check()
-	t.upd = st
+	t.setUpdateState(st)
 	if st.Err != "" {
 		updater.Log("手动检查失败：%s", st.Err)
 		t.balloon(title, "检查更新失败："+st.Err, win32.NIIFWarning)
@@ -148,7 +156,7 @@ func (t *App) checkUpdateAsync() {
 	updater.Log("手动检查：当前 %s，最新 %s", st.Current, st.Latest)
 	if st.HasUpdate {
 		// 手动检查就是要看到结果，这里不走"只提示一次"的去重
-		t.notifiedV = st.Latest
+		t.noteNotified(st.Latest)
 		t.balloon(title,
 			"发现新版本 "+st.Latest+"（当前 "+st.Current+"），右键可更新。",
 			win32.NIIFInfo)
@@ -162,17 +170,22 @@ func (t *App) checkUpdateAsync() {
 // 阶段 A（下载）服务照常跑；阶段 B（换目录）会短暂停机。
 // 整个流程在 goroutine 里，绝不能在 wndProc 里同步跑。
 func (t *App) applyUpdateAsync() {
-	if t.updating {
+	if !t.updating.CompareAndSwap(false, true) {
 		return
 	}
-	if !t.upd.HasUpdate || t.upd.Latest == "" {
+	defer t.updating.Store(false)
+
+	target := t.getUpdateState().Latest
+	if target == "" {
 		t.balloon(title, "没有可用的新版本，请先检查更新。", win32.NIIFWarning)
 		return
 	}
 
-	target := t.upd.Latest
-	t.updating = true
-	t.busy = true
+	// busy 只是「别同时启停」，重复升级已经由上面的 updating 挡住。
+	// 抢不到 busy 也能继续跑（可能正在启停中），所以**必须记下有没有抢到**：
+	// 只有自己抢到的才允许 clearBusy，否则会把别人的 busy 提前清掉，
+	// 让 refreshState 在服务还没起来时就把图标刷成"未运行"。
+	ownsBusy := t.markBusy()
 	t.setIcon(t.icons.busy)
 	t.setText("dsh web：正在更新到 " + target + "...")
 	t.balloon(title,
@@ -189,8 +202,9 @@ func (t *App) applyUpdateAsync() {
 
 	err := updater.Run(target, &upOpt, logf)
 
-	t.updating = false
-	t.busy = false
+	if ownsBusy {
+		t.clearBusy()
+	}
 
 	if err != nil {
 		t.setIcon(t.icons.stopped)
@@ -200,8 +214,8 @@ func (t *App) applyUpdateAsync() {
 	}
 
 	// 升级成功后状态全变了：重新读版本、刷新地址
-	t.url = service.LastURL(t.opt.Port)
-	t.upd = updateState{Current: target, Latest: target, CheckedAt: time.Now()}
+	t.setURL(service.LastURL(t.opt.Port))
+	t.setUpdateState(updateState{Current: target, Latest: target, CheckedAt: time.Now()})
 	t.refreshState()
 	t.balloon(title, "已更新到 "+target+"。", win32.NIIFInfo)
 }
@@ -218,11 +232,13 @@ func (t *App) applyUpdateAsync() {
 // 注意这一段是**同步**跑的，Stop 里最多会等 20 秒等进程退出。
 // dispatchCommand 用 goroutine 调本函数，所以不会卡住消息循环；
 // 但不要在 UI 线程（wndProc）里直接调它。
+//
+// beginExit 用 CAS 保证退出流程只跑一遍：菜单连点和 WM_CLOSE 路径
+// 可能同时进来，重复 Stop + 重复 delete 图标都是有害的。
 func (t *App) exit() {
-	if t.exiting {
+	if !t.beginExit() {
 		return
 	}
-	t.exiting = true
 
 	// 收掉后台更新检查，别让它在退出过程中还发请求
 	if t.updateStop != nil {

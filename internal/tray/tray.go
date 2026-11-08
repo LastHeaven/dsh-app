@@ -12,6 +12,7 @@ package tray
 import (
 	"embed"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -55,26 +56,113 @@ const (
 
 // App 是托盘的全部状态。
 //
-// 除了 hwnd/nid（只能在 UI 线程碰），其余字段的并发约定写在各自注释里。
+// **并发约定（改这个结构体之前先读完）：**
+//
+//   - hwnd / nid / icons / taskbarCreatedMsg：只在 UI 线程碰。
+//     nid 受 nidMu 保护（UI 线程只用 TryLock，绝不阻塞等锁）。
+//
+//   - busy / exiting / updating：**会被多个 goroutine 同时读改写**，
+//     所以一律用 atomic.Bool。尤其是 busy —— 菜单、管道转发、openUIAsync
+//     三条路径都会调 startAsync，无保护时两个 goroutine 能同时通过
+//     `if t.busy` 检查，各自跑一遍 Start()，两个 node 抢同一个端口。
+//     这是真实存在的竞争，不是理论风险（-race 可复现）。
+//
+//   - url / upd / notifiedV / wasRunning：受 stateMu 保护。
+//     用专门的 stateMu，不复用 nidMu —— nidMu 有"UI 线程绝不阻塞"的硬约定，
+//     混进普通读写会把那条纪律破坏掉。
 type App struct {
-	opt        *config.Options
-	hwnd       uintptr
-	nid        notifyIconData
-	icons      *iconSet
-	url        string
-	busy       bool
-	exiting    bool
-	wasRunning bool
+	opt   *config.Options
+	hwnd  uintptr
+	nid   notifyIconData
+	icons *iconSet
 
 	// TaskbarCreated 的消息 id：explorer 启动后会广播，收到就重建图标
 	taskbarCreatedMsg uint32
 
-	// 更新状态。只在这个结构体里存，UI 线程和后台 goroutine
-	// 通过 PostMessage(WMUpdateReady) 交接，避免并发读写界面状态。
+	// 三个跨 goroutine 的布尔标志，用 atomic.Bool 无锁读写
+	busy     atomicBool
+	exiting  atomicBool
+	updating atomicBool
+
+	// 受 stateMu 保护的普通字段
+	stateMu    sync.RWMutex
+	url        string
 	upd        updateState
-	updating   bool
 	notifiedV  string // 已经弹过气泡的版本，按版本去重
+	wasRunning bool
+
 	updateStop chan struct{}
+}
+
+// atomicBool 是 atomic.Bool 的别名，让字段声明读起来短一些。
+type atomicBool = atomic.Bool
+
+// ---------------------------------------------------------------- 状态访问器
+//
+// 统一走这几个方法，避免调用方漏锁。busy 的三态语义（开始/结束/查询）
+// 在外面直接操作容易写错，集中在这里更容易审查。
+
+// markBusy 尝试进入"忙"状态；已经在忙则返回 false（调用方应直接放弃）。
+//
+// **必须用 CAS**：先查后置的写法在并发下不成立。
+func (t *App) markBusy() bool {
+	return t.busy.CompareAndSwap(false, true)
+}
+
+func (t *App) clearBusy()      { t.busy.Store(false) }
+func (t *App) isBusy() bool    { return t.busy.Load() }
+func (t *App) isExiting() bool { return t.exiting.Load() }
+
+// beginExit 只在第一次调用时返回 true，用于保证退出流程只跑一遍。
+func (t *App) beginExit() bool {
+	return t.exiting.CompareAndSwap(false, true)
+}
+
+func (t *App) getURL() string {
+	t.stateMu.RLock()
+	defer t.stateMu.RUnlock()
+	return t.url
+}
+
+func (t *App) setURL(u string) {
+	t.stateMu.Lock()
+	t.url = u
+	t.stateMu.Unlock()
+}
+
+func (t *App) getUpdateState() updateState {
+	t.stateMu.RLock()
+	defer t.stateMu.RUnlock()
+	return t.upd
+}
+
+func (t *App) setUpdateState(s updateState) {
+	t.stateMu.Lock()
+	t.upd = s
+	t.stateMu.Unlock()
+}
+
+// noteNotified 记录"这个版本已经提示过"，并返回是否应当真的提示。
+func (t *App) noteNotified(version string) bool {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	if t.notifiedV == version {
+		return false
+	}
+	t.notifiedV = version
+	return true
+}
+
+func (t *App) getWasRunning() bool {
+	t.stateMu.RLock()
+	defer t.stateMu.RUnlock()
+	return t.wasRunning
+}
+
+func (t *App) setWasRunning(v bool) {
+	t.stateMu.Lock()
+	t.wasRunning = v
+	t.stateMu.Unlock()
 }
 
 var current *App

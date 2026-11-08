@@ -7,17 +7,16 @@
 //
 // 文件划分：
 //
-//	dll.go       DLL 与 proc 句柄、DLL_HANDLE
+//	dll.go       DLL 与 proc 句柄
 //	const.go     常量（窗口消息、菜单、通知区、进程权限……）
 //	struct.go    传给 Windows 的结构体（内存布局必须逐字节对得上）
-//
-// util.go       UTF-16 与 last-error 之类的小工具
-// kernel.go    kernel32：进程、句柄、同步、控制台
-// user.go      user32：窗口、消息循环、置前
-// menu.go      user32：弹出菜单
-// icon.go      user32：图标加载与销毁
-// notify.go    shell32：通知区图标、ShellExecuteW
-// net.go       iphlpapi/ntdll/advapi32/winhttp：TCP 表、命令行、网络
+//	util.go      UTF-16 与 last-error 之类的小工具
+//	kernel.go    kernel32：进程、句柄、同步、控制台
+//	user.go      user32：窗口、消息循环、置前
+//	menu.go      user32：弹出菜单
+//	icon.go      user32：图标加载与销毁
+//	notify.go    shell32：通知区图标、ShellExecuteW
+//	net.go       iphlpapi/ntdll/winhttp：TCP 表、命令行、网络
 package win32
 
 import "syscall"
@@ -28,7 +27,6 @@ var (
 	MODShell32  = syscall.NewLazyDLL("shell32.dll")
 	MODNtdll    = syscall.NewLazyDLL("ntdll.dll")
 	MODIphlpapi = syscall.NewLazyDLL("iphlpapi.dll")
-	MODAdvapi32 = syscall.NewLazyDLL("advapi32.dll")
 	MODGdi32    = syscall.NewLazyDLL("gdi32.dll")
 	MODWinhttp  = syscall.NewLazyDLL("winhttp.dll")
 )
