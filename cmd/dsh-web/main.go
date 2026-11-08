@@ -1,16 +1,20 @@
 //go:build windows
 
-// dsh web 托盘版 —— Go 重写版。
+// dsh web 托盘版 —— 程序入口。
 //
 // 常驻右下角通知区，用鲸鱼图标表示状态：
 //
-//	黑色 = 运行中   琥珀色 = 启动中/异常   灰色 = 未运行
+//	蓝色 = 运行中   琥珀色 = 启动中/异常   灰色 = 未运行
 //
 // 左键点击 = 打开管理界面；右键 = 启动 / 停止 / 重启 / 打开目录 / 退出。
 //
 // 命令行参数（供脚本、计划任务调用，跑完即退，不显示托盘）：
 //
 //	-Port 8080  -NoBrowser  -KeepExisting  -Stop  -DryRun  -Headless  -Help
+//	-CheckUpdate  -Update  -UpdateTo <ver>  -Force  -NoUpdateCheck
+//
+// 这个文件只做「分流」：把命令行判成四条互斥的路径，然后交给 internal 包。
+// 具体实现都在 internal/ 下，见 docs/ARCHITECTURE.md。
 package main
 
 import (
@@ -18,16 +22,26 @@ import (
 	"os"
 	"runtime"
 	"strings"
+
+	"github.com/LastHeaven/dsh-app/internal/applog"
+	"github.com/LastHeaven/dsh-app/internal/cli"
+	"github.com/LastHeaven/dsh-app/internal/config"
+	"github.com/LastHeaven/dsh-app/internal/service"
+	"github.com/LastHeaven/dsh-app/internal/single"
+	"github.com/LastHeaven/dsh-app/internal/tray"
+	"github.com/LastHeaven/dsh-app/internal/updater"
+	"github.com/LastHeaven/dsh-app/internal/win32"
 )
 
 func main() {
 	// 必须在任何输出之前接管父控制台，否则中文乱码
-	initConsole()
+	cli.Init()
 
-	opt := parseOptions(os.Args[1:])
+	args := os.Args[1:]
+	opt := cli.ParseOptions(args)
 
 	if opt.ShowHelp {
-		printHelp()
+		cli.PrintHelp()
 		return
 	}
 
@@ -35,7 +49,7 @@ func main() {
 	if opt.CheckUpdate {
 		os.Exit(runCheckUpdate())
 	}
-	if opt.UpdateTo != "" || isUpdateRequested(os.Args[1:]) {
+	if opt.UpdateTo != "" || isUpdateRequested(args) {
 		os.Exit(runUpdateCommand(opt))
 	}
 
@@ -47,14 +61,19 @@ func main() {
 	}
 
 	// 单实例：已有托盘在跑就把命令转交给它，避免出现第二个图标
-	isPrimary, mutexErr := acquireSingleInstance()
-	diagLog("single-instance: primary=%v err=%v pid=%d", isPrimary, mutexErr, os.Getpid())
+	isPrimary, mutexErr := single.Acquire()
+	applog.Diag("single-instance: primary=%v err=%v pid=%d", isPrimary, mutexErr, os.Getpid())
 	if !isPrimary {
-		forwardCommand(os.Args[1:])
-		diagLog("forwarded, exiting")
+		single.Forward(args)
+		applog.Diag("forwarded, exiting")
 		return
 	}
 
+	runTray(opt)
+}
+
+// runTray 是托盘路径。单独拆出来是为了让 main 保持"分流器"的形状。
+func runTray(opt *config.Options) {
 	// **必须锁定 OS 线程，这是托盘的命门。**
 	//
 	// Win32 的窗口、定时器、消息队列全都绑定在**创建它的那个 OS 线程**上：
@@ -68,25 +87,24 @@ func main() {
 	// 表现成"托盘点了没反应、定时刷新也停了"。
 	//
 	// 实测症状很有欺骗性：进程 Responding 为 True、goroutine 栈显示卡在
-	// getMessage（正常的空闲等待），看门狗只能看到"心跳不涨"。
+	// GetMessage（正常的空闲等待），看门狗只能看到"心跳不涨"。
 	//
 	// LockOSThread 之后 main goroutine 终身绑定一条线程，窗口/定时器/消息
 	// 循环都在同一条线程上，问题消失。
 	runtime.LockOSThread()
 
-	setProcessDpiAwarenessContext(dpiAwarenessPerMonitorV2)
+	win32.SetProcessDpiAwarenessContext(win32.DPIAwarenessPerMonitorV2)
 
-	app := newTrayApp(opt)
-	tray = app
+	app := tray.New(opt)
 
 	// 后台收转交过来的命令（Headless 路径不会走到这里）
 	go func() {
-		for line := range commandCh {
-			handleForwarded(line)
+		for line := range single.Commands() {
+			tray.HandleForwarded(line)
 		}
 	}()
 
-	defer cleanupIconTemp()
+	defer tray.CleanupTemp()
 	app.Run()
 
 	// Run() 只在消息循环结束时返回。**必须在这里让进程真正退出**：
@@ -96,69 +114,69 @@ func main() {
 	//
 	// 实测过：进程存活、11 个线程、HandleCount 393，但 EnumWindows
 	// 查这个 PID 的顶层窗口数是 0。
-	diagLog("Run() 返回，消息循环已结束，退出进程")
+	applog.Diag("Run() 返回，消息循环已结束，退出进程")
 	os.Exit(0)
 }
 
 // runHeadless 跑完即退的三条路径：DryRun / Stop / 启动。
-func runHeadless(opt *Options) int {
-	con.Say("[启动] 参数 Port=" + itoa(opt.Port) +
-		" DryRun=" + boolStr(opt.DryRun) + " Stop=" + boolStr(opt.StopOnly) +
-		" NoBrowser=" + boolStr(opt.NoBrowser) + " KeepExisting=" + boolStr(opt.KeepExisting))
+func runHeadless(opt *config.Options) int {
+	cli.Say("[启动] 参数 Port=" + cli.Itoa(opt.Port) +
+		" DryRun=" + cli.BoolStr(opt.DryRun) + " Stop=" + cli.BoolStr(opt.StopOnly) +
+		" NoBrowser=" + cli.BoolStr(opt.NoBrowser) + " KeepExisting=" + cli.BoolStr(opt.KeepExisting))
 
 	if opt.DryRun {
-		live := liveWeb()
+		live := service.Live()
 		if len(live) > 0 {
 			parts := make([]string, 0, len(live))
 			for _, p := range live {
-				parts = append(parts, "PID "+itoa(int(p.PID)))
+				parts = append(parts, "PID "+cli.Itoa(int(p.PID)))
 			}
-			con.Say("检测到 dsh web：" + joinComma(parts))
+			cli.Say("检测到 dsh web：" + cli.JoinComma(parts))
 		} else {
-			con.Say("未检测到已运行的 dsh web。")
+			cli.Say("未检测到已运行的 dsh web。")
 		}
 		return 0
 	}
 
 	if opt.StopOnly {
-		n := Stop(opt.Port)
+		n := service.Stop(opt.Port)
 		if n > 0 {
-			con.Say("dsh web 已关闭（端口 " + itoa(opt.Port) + "，结束 " + itoa(n) + " 个进程）。")
+			cli.Say("dsh web 已关闭（端口 " + cli.Itoa(opt.Port) + "，结束 " + cli.Itoa(n) + " 个进程）。")
 		} else {
-			con.Say("端口 " + itoa(opt.Port) + " 上没有运行中的 dsh web。")
+			cli.Say("端口 " + cli.Itoa(opt.Port) + " 上没有运行中的 dsh web。")
 		}
 		return 0
 	}
 
-	url, err := Start(opt)
+	url, err := service.Start(opt)
 	if err != nil {
-		con.Say("启动失败：" + err.Error())
+		cli.Say("启动失败：" + err.Error())
 		return 1
 	}
-	con.Say("dsh web 已启动：" + url)
+	cli.Say("dsh web 已启动：" + url)
 	return 0
 }
 
 // runCheckUpdate 查一次最新版就退出（脚本/排障用）。
 func runCheckUpdate() int {
-	root := dshInstallRoot()
+	root := updater.InstallRoot()
 	if root == "" {
-		con.Say("未找到 dsh 安装目录，请确认已执行：npm i -g @deepseek-ai/dsh")
+		cli.Say("未找到 dsh 安装目录，请确认已执行：npm i -g @deepseek-ai/dsh")
 		return 1
 	}
-	con.Say("安装目录：" + root)
-	con.Say("当前版本：" + localDshVersion(root))
+	cli.Say("安装目录：" + root)
+	cli.Say("当前版本：" + updater.LocalVersion(root))
 
-	st := checkUpdate()
+	st := updater.Check()
 	if st.Err != "" {
-		con.Say("检查失败：" + st.Err)
+		cli.Say("检查失败：" + st.Err)
 		return 1
 	}
-	con.Say("最新版本：" + st.Latest)
+	cli.Say("最新版本：" + st.Latest)
 	if st.HasUpdate {
-		con.Say("有新版本可用：" + st.Current + " → " + st.Latest)
+		cli.Say("有新版本可用：" + st.Current + " → " + st.Latest)
 	} else {
-		con.Say("已是最新版本。")
+		cli.Say("已是最新版本。")
 	}
 	return 0
 }
@@ -166,41 +184,41 @@ func runCheckUpdate() int {
 // runUpdateCommand 执行升级（-Update / -UpdateTo）。
 //
 // **注意这里会短暂停止服务**，所以必须提示清楚，不能静默跑。
-func runUpdateCommand(opt *Options) int {
+func runUpdateCommand(opt *config.Options) int {
 	target := opt.UpdateTo
 	if target == "" {
-		st := checkUpdate()
+		st := updater.Check()
 		if st.Err != "" {
-			con.Say("检查更新失败：" + st.Err)
+			cli.Say("检查更新失败：" + st.Err)
 			return 1
 		}
 		if !st.HasUpdate {
-			con.Say("已是最新版本（" + st.Current + "），无需升级。")
+			cli.Say("已是最新版本（" + st.Current + "），无需升级。")
 			return 0
 		}
 		target = st.Latest
 	}
 
-	con.Say("准备升级到 " + target + "（过程中服务会短暂停止）")
+	cli.Say("准备升级到 " + target + "（过程中服务会短暂停止）")
 
 	// 命令行路径要显式打日志到控制台，托盘路径由 tray 自己显示
 	logf := func(format string, a ...interface{}) {
 		msg := fmt.Sprintf(format, a...)
-		con.Say(msg)
-		updateLog("%s", msg)
+		cli.Say(msg)
+		updater.Log("%s", msg)
 	}
 
 	// 命令行升级不自动开浏览器（升级完服务已在跑，用户自己开）
 	upOpt := *opt
 	upOpt.NoBrowser = true
 
-	if err := runUpdate(target, &upOpt, logf); err != nil {
-		con.Say("升级失败：" + err.Error())
-		updateLog("升级失败：%v", err)
+	if err := updater.Run(target, &upOpt, logf); err != nil {
+		cli.Say("升级失败：" + err.Error())
+		updater.Log("升级失败：%v", err)
 		return 1
 	}
-	con.Say("升级完成：" + target)
-	updateLog("升级完成：%s", target)
+	cli.Say("升级完成：" + target)
+	updater.Log("升级完成：%s", target)
 	return 0
 }
 
@@ -213,55 +231,4 @@ func isUpdateRequested(args []string) bool {
 		}
 	}
 	return false
-}
-
-// diagLog 写诊断日志（托盘没有控制台，问题只能靠文件排查）。
-func diagLog(format string, a ...interface{}) {
-	f, err := os.OpenFile(joinPath(Paths.Root(), "tray-diag.log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.WriteString(timestamp() + "  " + fmt.Sprintf(format, a...) + "\r\n")
-}
-
-func boolStr(b bool) string {
-	if b {
-		return "True"
-	}
-	return "False"
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [12]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}
-
-func joinComma(parts []string) string {
-	out := ""
-	for i, p := range parts {
-		if i > 0 {
-			out += ", "
-		}
-		out += p
-	}
-	return out
 }

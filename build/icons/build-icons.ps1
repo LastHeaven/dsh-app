@@ -1,30 +1,34 @@
-﻿# 生成图标：
-#   - 托盘三态图标（透明底鲸鱼）：assets\running.ico / stopped.ico / busy.ico
-#   - exe 主图标（白底圆角卡片 + 黑鲸鱼）：app.ico
+﻿# 生成图标。
 #
-# 用法：
-#   powershell -NoProfile -ExecutionPolicy Bypass -File icon-src\build-icons.ps1
+# 输出两套，**不能混用**：
+#   - 托盘三态图标（透明底鲸鱼）→ internal\tray\icons\*.ico
+#     go:embed 就是从这个目录读的，所以生成物要直接落在这里（已提交到仓库）。
+#   - exe 主图标（白底圆角卡片 + 黑鲸鱼）→ build\app.ico
+#     给 windres 链进 exe，贴在资源管理器/任务栏上。
 #
-# 依赖：Chrome（用于把 SVG 渲染成 PNG）、Python + Pillow（用于打包 ICO）
+# 用法（必须用 powershell，脚本是 UTF-8 带 BOM，PS 5.1 靠 BOM 认编码）：
+#   powershell -NoProfile -ExecutionPolicy Bypass -File build\icons\build-icons.ps1
+#
+# 依赖：Chrome（把 SVG 渲染成 PNG）、Python + Pillow（打包 ICO）
 #
 # 之所以不是纯 Python：本机实测 Python 直接调 Chrome --headless 截图不稳定
 # （进程返回 0 但不产出文件），PowerShell 的 Start-Process 一直可靠。
 #
-# 注意：托盘图标必须**透明底**（叠在任务栏上），
-#       exe 图标必须**白底圆角卡片**（叠在资源管理器的深浅背景上）。
-#       两者不能混用，改了颜色/底色前先想清楚是哪一套。
+# 托盘图标必须**透明底**（叠在任务栏上），
+# exe 图标必须**白底圆角卡片**（叠在资源管理器的深浅背景上）。
 
 $ErrorActionPreference = 'Stop'
 
-$root = Split-Path -Parent $PSScriptRoot      # 仓库根目录
-$assets = Join-Path $root 'assets'
+$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)   # 仓库根目录
+$trayDir = Join-Path $repo 'internal\tray\icons'                # 托盘图标（go:embed 目标）
+$appDir = Join-Path $repo 'build'                               # exe 图标（windres 目标）
 $work = Join-Path $PSScriptRoot '.work'
 $whaleSvg = Join-Path $PSScriptRoot 'svg\whale.svg'
 
 if (-not (Test-Path $whaleSvg)) {
     throw "找不到鲸鱼路径源文件：$whaleSvg"
 }
-New-Item -ItemType Directory -Path $assets, $work -Force | Out-Null
+New-Item -ItemType Directory -Path $trayDir, $appDir, $work -Force | Out-Null
 
 # ---- 1) 找 Chrome -----------------------------------------------------------
 $chrome = @(
@@ -53,20 +57,13 @@ $states = [ordered]@{
     app     = '#0B0B0F'   # exe 自身图标：黑鱼 + 白底圆角卡片
 }
 
-# exe 图标的白底卡片：与 D:\agents\dsh\icons\dsh-icon.svg 同款观感
-# （白色圆角方块 + 极淡描边 + 轻微投影），这样在资源管理器/任务栏的
-# 深浅背景上都看得清。托盘图标不加这个背景。
-$appCornerRadius = 228.0 / 1024.0 * 1024.0   # 以 1024 画布为基准
-$appCardInset = 0.0
-
 # ---- 3) 渲染成 1024 PNG ----------------------------------------------------
 foreach ($name in $states.Keys) {
     $ink = $states[$name]
 
     if ($name -eq 'app') {
         # 白底圆角卡片 + 缩小的鲸鱼（卡片内留边距，鲸鱼不贴边）
-        # 0.80 是照着 D:\agents\dsh\icons\preview.png 的观感调的：
-        # 再小就显得空，再大鲸鱼会顶到圆角。
+        # 0.80 是照着图标预览图的观感调的：再小就显得空，再大鲸鱼会顶到圆角。
         $cardScale = 0.80
         $fishScale = $scale * $cardScale
         $fishTx = (1024.0 - 23.16 * $fishScale) / 2.0
@@ -128,7 +125,8 @@ foreach ($name in $states.Keys) {
 
 # ---- 4) 打包成多尺寸 ICO（由 Python/Pillow 完成） ---------------------------
 $py = Join-Path $PSScriptRoot 'pack_ico.py'
-& python $py $work $assets
+& python $py $work $trayDir $appDir
 if ($LASTEXITCODE -ne 0) { throw "pack_ico.py 失败（退出码 $LASTEXITCODE）" }
 
-Write-Host '图标已生成到 assets\'
+Write-Host "托盘图标 -> $trayDir"
+Write-Host "exe 图标 -> $appDir\app.ico"

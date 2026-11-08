@@ -83,7 +83,7 @@ jobs:
             $isTag = 'true'
           } else {
             # 手动触发：用当前 rc 文件里的版本，仅验证流程
-            $rc = [IO.File]::ReadAllText('app.version.rc', [Text.Encoding]::UTF8)
+            $rc = [IO.File]::ReadAllText('build/app.version.rc', [Text.Encoding]::UTF8)
             $m = [regex]::Match($rc, '(?m)^#define VER_PRODUCTVERSION_STR\s+"([^"]+)"')
             $v = $m.Groups[1].Value
             $isTag = 'false'

@@ -1,5 +1,10 @@
 //go:build windows
 
+// Package updater 是 dsh 版本检测与两阶段升级。改之前先读 docs/UPDATE.md。
+package updater
+
+import "strings"
+
 // SemVer 解析与比较。
 //
 // 自己实现，不引第三方包（本机 go get 不可用）。按 semver.org 2.0.0：
@@ -11,21 +16,15 @@
 //   - 同长度逐段比，数字段按数值（rc.10 > rc.9，**不是字典序**）
 //   - 数字段 < 字母段（1.0.0-alpha.1 < 1.0.0-alpha.beta）
 //   - 段少的小（1.0.0-alpha < 1.0.0-alpha.1）
-package main
-
-import (
-	"strings"
-)
-
-type semVer struct {
+type SemVer struct {
 	major, minor, patch int
 	pre                 []string // 预发布标识符，空表示正式版
 	valid               bool
 }
 
-// buildMeta 会被丢弃（按 SemVer 规定不参与比较），这里只留个占位说明。
-func parseSemVer(s string) semVer {
-	var v semVer
+// ParseSemVer 解析版本号；非法版本的 Valid() 为 false。
+func ParseSemVer(s string) SemVer {
+	var v SemVer
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "v")
 	s = strings.TrimPrefix(s, "V")
@@ -63,6 +62,9 @@ func parseSemVer(s string) semVer {
 	return v
 }
 
+// Valid 表示版本号是否解析成功。
+func (v SemVer) Valid() bool { return v.valid }
+
 // atoiStrict 只接受纯数字，不接受空串、符号、空白。
 func atoiStrict(s string) (int, bool) {
 	if s == "" {
@@ -81,9 +83,9 @@ func atoiStrict(s string) (int, bool) {
 	return n, true
 }
 
-// compareSemVer 返回 -1 / 0 / 1。
-// 任一版本非法时返回 0（调用方应先检查 valid，避免把垃圾当成"相同"）。
-func compareSemVer(a, b semVer) int {
+// CompareSemVer 返回 -1 / 0 / 1。
+// 任一版本非法时返回 0（调用方应先检查 Valid，避免把垃圾当成"相同"）。
+func CompareSemVer(a, b SemVer) int {
 	if !a.valid || !b.valid {
 		return 0
 	}
@@ -141,13 +143,13 @@ func cmpInt(a, b int) int {
 	return 0
 }
 
-// isNewer 判断 remote 是否比 local 新。任一非法一律返回 false ——
+// IsNewer 判断 remote 是否比 local 新。任一非法一律返回 false ——
 // 宁可漏报也绝不能提示一个不存在的更新。
-func isNewer(remote, local string) bool {
-	r := parseSemVer(remote)
-	l := parseSemVer(local)
+func IsNewer(remote, local string) bool {
+	r := ParseSemVer(remote)
+	l := ParseSemVer(local)
 	if !r.valid || !l.valid {
 		return false
 	}
-	return compareSemVer(r, l) > 0
+	return CompareSemVer(r, l) > 0
 }

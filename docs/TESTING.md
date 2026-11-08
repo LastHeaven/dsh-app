@@ -46,7 +46,7 @@ git push origin v1.0.1
 ./build.ps1 -SetVersion 1.0.1
 ```
 
-版本号写在 **`app.version.rc`**，`-SetVersion` 会改写它。
+版本号写在 **`build/app.version.rc`**，`-SetVersion` 会改写它。
 不带参数时用文件里的默认值。`build.ps1` 结尾自动校验并打印
 `[ok] 版本信息：x.y.z`。
 
@@ -60,7 +60,7 @@ git push origin v1.0.1
 Release 附件传 `publish\dsh-web.exe`。注意仓库里**不提交 exe**
 （`.gitignore` 排除了 `*.exe`），二进制只走 Releases。
 
-> 改 `app.version.rc` 时留意：windres 的 VERSIONINFO 语法挑剔 ——
+> 改 `build/app.version.rc` 时留意：windres 的 VERSIONINFO 语法挑剔 ——
 > 不支持 `\u` 转义（字符串只能用 ASCII），`VarFileInfo` 里只接受
 > **一条** `Translation`，多写一条会报 `syntax error`。
 > 也**别用 `-D` 覆盖版本**：字符串型 `-D` 要带内层引号，PowerShell 下
@@ -188,11 +188,11 @@ Test-Path D:\npm\.dsh-web-stage            # 必须是 False
 改了鲸鱼形状或配色后：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File icon-src\build-icons.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File build\icons\build-icons.ps1
 ```
 
 需要 Chrome（渲染 SVG）和 Python + Pillow（打包 ICO）。之后要重新跑
-`build.ps1`，windres 才会把新的 `app.ico` 链进 exe。
+`build.ps1`，windres 才会把新的 `build\app.ico` 链进 exe。
 
 ## 验证清单
 

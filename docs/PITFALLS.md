@@ -28,7 +28,7 @@
 
 原则：**宁可「该停的没停」，也绝不「多停一个」。**
 
-实现在 `procListensOnPort()`（`service.go`）。改它之前先读完本节。
+实现在 `listensOnPort()`（`internal/service/service.go`）。改它之前先读完本节。
 
 ### 不要递归杀子进程树
 
@@ -91,7 +91,7 @@ Go 会按 MS 转义规则把参数拼成命令行，而 `explorer.exe` 对引号
 | 同上 + `HideWindow:true` | 没开文件夹（碰巧，不可靠） |
 | `ShellExecuteW("open", url, ...)` | 正常调起浏览器 |
 
-**正确做法**：`shellExecuteOpen()`（`win32.go`），它就是 C# 版
+**正确做法**：`ShellExecuteOpen()`（`internal/win32/notify.go`），它就是 C# 版
 `UseShellExecute = true` 背后的东西。返回值 `> 32` 才算成功。
 **顺带的好处**：浏览器由 shell 以用户身份启动，不会被本程序的管理员权限
 带成提权进程。
@@ -155,12 +155,12 @@ Go 会按 MS 转义规则把参数拼成命令行，而 `explorer.exe` 对引号
 
 ### 两套图标不能混用
 
-- **托盘三态**（`assets/*.ico`）：**透明底**，叠在任务栏上。
-- **exe 主图标**（`app.ico`）：**白底圆角卡片**，叠在资源管理器/开始菜单的
+- **托盘三态**（`internal/tray/icons/*.ico`，go:embed）：**透明底**，叠在任务栏上。
+- **exe 主图标**（`build/app.ico`，windres 链进 exe）：**白底圆角卡片**，叠在资源管理器/开始菜单的
   深浅背景上。
 
 三态颜色必须区分：`#0B0B0F` 运行中 / `#9AA0AE` 未运行 / `#D99B00` 启动中。
-形状取 `icon-src/svg/whale.svg`。
+形状取 `build/icons/svg/whale.svg`。
 
 ---
 
@@ -527,10 +527,10 @@ Go 运行时都可能把这个 goroutine 挪到另一条 OS 线程。一旦发�
 ```
 goroutine 1 [syscall]:
     syscall.SyscallN(...)
-    main.getMessage(...)
-    dsh-web/win32.go:479
-    main.(*TrayApp).messageLoop(...)
-    dsh-web/tray.go:316
+    github.com/LastHeaven/dsh-app/internal/win32.GetMessage(...)
+    github.com/LastHeaven/dsh-app/internal/win32/user.go:99
+    github.com/LastHeaven/dsh-app/internal/tray.(*App).messageLoop(...)
+    github.com/LastHeaven/dsh-app/internal/tray/app.go:340
 ```
 
 看到「卡在 `getMessage` 的 syscall」就对了 —— 但注意这本身是**正常的空闲
@@ -539,12 +539,12 @@ goroutine 1 [syscall]:
 **修法**：在 `main` 里建窗口之前锁死线程。
 
 ```go
-func main() {
-	...
-	runtime.LockOSThread()   // 必须在 CreateWindow 之前
+func runTray(opt *config.Options) {
+	// 必须在 tray.New / Run 之前（也就是 CreateWindow 之前）
+	runtime.LockOSThread()
 
-	setProcessDpiAwarenessContext(...)
-	newTrayApp(opt).Run()    // 建窗口 + 定时器 + 消息循环，全在这条线程上
+	win32.SetProcessDpiAwarenessContext(win32.DPIAwarenessPerMonitorV2)
+	tray.New(opt).Run()      // 建窗口 + 定时器 + 消息循环，全在这条线程上
 }
 ```
 
@@ -587,7 +587,7 @@ Go 在 Windows 上默认按 UTF-8 写 stdout，而 cmd/PowerShell 控制台是 G
 ### `.ps1` 必须存成 UTF-8 带 BOM
 
 Windows PowerShell 5.1 按 GBK 解析无 BOM 的 `.ps1`，中文会乱码并导致引号配对
-错乱、语法报错。`build.ps1` 和 `icon-src/build-icons.ps1` 都是带 BOM 的。
+错乱、语法报错。`build.ps1` 和 `build/icons/build-icons.ps1` 都是带 BOM 的。
 改完 `.ps1` 要确认前三个字节是 `EF BB BF`。
 
 **这个坑踩过三次以上，全都是用编辑工具改完 `.ps1` 之后 BOM 被吃掉。**
@@ -617,9 +617,9 @@ $t=[IO.File]::ReadAllText($p,(New-Object Text.UTF8Encoding($false)))
 
 想用 `-DVER_PRODUCTVERSION_STR="1.2.3"` 在编译期换版本号 —— 不行。
 字符串型 `-D` 需要内层引号，而各 shell 的转义规则不一致，PowerShell 下
-实测直接 `app.version.rc:46: syntax error`。
+实测直接 `build/app.version.rc:46: syntax error`。
 
-**正确做法**：让脚本改写 `app.version.rc` 文件本身（`build.ps1 -SetVersion`），
+**正确做法**：让脚本改写 `build/app.version.rc` 文件本身（`build.ps1 -SetVersion`），
 改文件比拼命令行可靠得多。
 
 ### 别用 PowerShell 的 `Set-Content` 改 `.go` 文件

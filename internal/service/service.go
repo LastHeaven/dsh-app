@@ -1,6 +1,10 @@
 //go:build windows
 
-package main
+// Package service 是 dsh web 服务进程的查询、启停与地址回收。
+//
+// 这个包里最需要小心的是 Stop —— 出过两次真实事故，
+// 详见 Stop 的注释与 docs/PITFALLS.md。
+package service
 
 import (
 	"errors"
@@ -8,26 +12,40 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
+
+	"github.com/LastHeaven/dsh-app/internal/config"
+	"github.com/LastHeaven/dsh-app/internal/paths"
+	"github.com/LastHeaven/dsh-app/internal/procs"
+	"github.com/LastHeaven/dsh-app/internal/win32"
 )
 
-// ------------------------------------------------------------------ 进程查询
+var (
+	binPattern = regexp.MustCompile(`(?i)@deepseek-ai[\\/]dsh[\\/]lib[\\/]bin\.js`)
+	webPattern = regexp.MustCompile(`(?i)(^|\s)web(\s|$)`)
+	urlPattern = regexp.MustCompile(`https?://[^\s"']+`)
+)
 
-// liveWeb 返回所有「确实是 dsh web」的进程。
+// DefaultPort 是 dsh web 不带 --port 时的默认端口（与 config.DefaultPort 一致）。
+const DefaultPort = config.DefaultPort
+
+// ---------------------------------------------------------------- 进程查询
+
+// Live 返回所有「确实是 dsh web」的进程。
 //
 // 判定条件：node.exe 且命令行同时含
 //   - @deepseek-ai/dsh/lib/bin.js
 //   - 独立的 web 参数
 //
 // 两条都要满足，否则会误伤同一台机器上的 dsh CLI 会话。
-func liveWeb() []nodeProc {
-	invalidateSnapshot()
-	var out []nodeProc
-	for _, p := range snapshotProcs() {
+func Live() []procs.Process {
+	procs.Invalidate()
+	var out []procs.Process
+	for _, p := range procs.Snapshot() {
 		if !binPattern.MatchString(p.Cmd) || !webPattern.MatchString(p.Cmd) {
 			continue
 		}
@@ -36,20 +54,17 @@ func liveWeb() []nodeProc {
 	return out
 }
 
-// defaultPort 是 dsh web 不带 --port 时的默认端口。
-const defaultPort = 3080
-
-// procListensOnPort 判断某个 dsh web 进程是不是跑在指定端口上。
+// listensOnPort 判断某个 dsh web 进程是不是跑在指定端口上。
 //
 // 依据命令行：`... bin.js web --port 3199 --no-open`。
 // **没有 --port 参数时它跑在默认 3080 上** —— 这一点是早期事故的根源：
 // 只按「web 参数」匹配会把不带 --port 的 3080 实例也当成候选，
 // 于是 -Stop -Port 3199 在回落时把它停了。
-func procListensOnPort(cmd string, port int) bool {
+func listensOnPort(cmd string, port int) bool {
 	if p, ok := explicitPort(cmd); ok {
 		return p == port
 	}
-	return port == defaultPort
+	return port == DefaultPort
 }
 
 // explicitPort 从命令行里抽 `--port N` / `--port=N` / `-p N`。
@@ -73,77 +88,30 @@ func explicitPort(cmd string) (int, bool) {
 	return 0, false
 }
 
-// portOwnerPid 返回监听该端口的进程 pid，没有则 0。
-//
-// 坑：端口号在 dwLocalPort 里是**高字节序存在低 16 位**，必须换字节序再比。
-// 表类型用 TCP_TABLE_OWNER_PID_ALL(=5)，不是 ..._LISTENER(=3)。
-// 行布局（24 字节）：
-//
-//	dwState(0) dwLocalAddr(4) dwLocalPort(8) dwRemoteAddr(12)
-//	dwRemotePort(16) dwOwningPid(20)
-func portOwnerPid(port int) uint32 {
-	pid, _ := tcpRowFor(port, true)
-	if pid > 0 {
-		return pid
-	}
-	pid, _ = tcpRowFor(port, false)
-	return pid
-}
-
-// tcpRowFor 找指定端口对应的 pid。listenOnly=true 只认 LISTEN 状态。
-func tcpRowFor(port int, listenOnly bool) (uint32, bool) {
-	var size uint32
-	procGetExtendedTcpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, afInet, tcpTableOwnerPidAll, 0)
-	if size == 0 {
+func atoi(s string) (int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
 		return 0, false
 	}
-	buf := make([]byte, size)
-	r, _, _ := procGetExtendedTcpTable.Call(
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(unsafe.Pointer(&size)),
-		0, afInet, tcpTableOwnerPidAll, 0)
-	if r != 0 {
-		return 0, false
-	}
-	if len(buf) < 4 {
-		return 0, false
-	}
-
-	count := *(*uint32)(unsafe.Pointer(&buf[0]))
-	const rowSize = 24
-	for i := uint32(0); i < count; i++ {
-		off := 4 + int(i)*rowSize
-		if off+rowSize > len(buf) {
-			break
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, false
 		}
-		state := *(*uint32)(unsafe.Pointer(&buf[off+0]))
-		rawPort := *(*uint32)(unsafe.Pointer(&buf[off+8]))
-		// 高字节序存在低 16 位，先换字节序
-		localPort := int((rawPort&0xFF)<<8 | (rawPort>>8)&0xFF)
-		if localPort != port {
-			continue
-		}
-		if listenOnly && state != 2 { // 2 = MIB_TCP_STATE_LISTEN
-			continue
-		}
-		owner := *(*uint32)(unsafe.Pointer(&buf[off+20]))
-		if owner > 0 {
-			return owner, true
+		n = n*10 + int(c-'0')
+		if n > 65535 {
+			return 0, false
 		}
 	}
-	return 0, false
+	return n, true
 }
 
-func pidAlive(pid uint32) bool {
-	h, err := openProcess(processQueryLimitedInformation, pid)
-	if err != nil {
-		return false
-	}
-	defer closeHandle(h)
-	// 已退出的进程句柄会立即 signaled
-	const waitTimeout = 0
-	return waitForSingleObject(h, waitTimeout) != 0 // WAIT_TIMEOUT(258) = 还活着
+// PortOwnerPid 返回监听该端口的进程 pid，没有则 0。
+func PortOwnerPid(port int) uint32 {
+	return win32.PortOwnerPid(port)
 }
+
+// ---------------------------------------------------------------- 停止
 
 // Stop 停掉**指定端口上**的 dsh web，返回结束的进程数。
 //
@@ -165,16 +133,16 @@ func pidAlive(pid uint32) bool {
 //
 // 宁可「该停的没停」，也绝不「多停一个」。
 func Stop(port int) int {
-	live := liveWeb()
+	live := Live()
 	if len(live) == 0 {
 		return 0
 	}
 
 	var targets []uint32
-	owner := portOwnerPid(port)
+	owner := PortOwnerPid(port)
 
 	for _, p := range live {
-		if !procListensOnPort(p.Cmd, port) {
+		if !listensOnPort(p.Cmd, port) {
 			continue
 		}
 		// 命令行说它跑在 port 上。如果端口还有归属且对不上，说明不是它，
@@ -190,9 +158,9 @@ func Stop(port int) int {
 	}
 
 	for _, pid := range targets {
-		if h, err := openProcess(processTerminate, pid); err == nil {
-			terminateProcess(h, 1)
-			closeHandle(h)
+		if h, err := win32.OpenProcess(win32.ProcessTerminate, pid); err == nil {
+			win32.TerminateProcess(h, 1)
+			win32.CloseHandle(h)
 		}
 	}
 
@@ -200,7 +168,7 @@ func Stop(port int) int {
 	for time.Now().Before(deadline) {
 		anyAlive := false
 		for _, pid := range targets {
-			if pidAlive(pid) {
+			if procs.Alive(pid) {
 				anyAlive = true
 				break
 			}
@@ -213,19 +181,19 @@ func Stop(port int) int {
 
 	// 还活着就再补一刀
 	for _, pid := range targets {
-		if pidAlive(pid) {
-			if h, err := openProcess(processTerminate, pid); err == nil {
-				terminateProcess(h, 1)
-				closeHandle(h)
+		if procs.Alive(pid) {
+			if h, err := win32.OpenProcess(win32.ProcessTerminate, pid); err == nil {
+				win32.TerminateProcess(h, 1)
+				win32.CloseHandle(h)
 			}
 		}
 	}
 
-	invalidateSnapshot()
+	procs.Invalidate()
 	return len(targets)
 }
 
-// ------------------------------------------------------------------ 启动
+// ---------------------------------------------------------------- 启动
 
 // captureWriter 边写日志边抓访问地址。
 type captureWriter struct {
@@ -253,37 +221,37 @@ func (c *captureWriter) String() string {
 }
 
 // Start 后台拉起 dsh web，返回带 token 的访问地址。
-func Start(opt *Options) (string, error) {
+func Start(opt *config.Options) (string, error) {
 	// 只有目标端口确实被占着时才停那一个实例，不影响其它端口
-	if Paths.IsPortListening(opt.Port) && !opt.KeepExisting {
+	if paths.IsPortListening(opt.Port) && !opt.KeepExisting {
 		Stop(opt.Port)
 	}
 
-	node := Paths.ResolveNode()
+	node := paths.ResolveNode()
 	if node == "" {
 		return "", errors.New("未找到 node.exe，请确认 Node.js 已安装并加入 PATH。")
 	}
-	bin := Paths.ResolveDshBin()
+	bin := paths.ResolveDshBin()
 	if bin == "" {
 		return "", errors.New("未找到 dsh 入口 bin.js，请确认已执行：npm i -g @deepseek-ai/dsh")
 	}
 
 	// 等端口腾出来
 	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) && Paths.IsPortListening(opt.Port) {
+	for time.Now().Before(deadline) && paths.IsPortListening(opt.Port) {
 		time.Sleep(300 * time.Millisecond)
 	}
-	if Paths.IsPortListening(opt.Port) {
+	if paths.IsPortListening(opt.Port) {
 		return "", fmt.Errorf("端口 %d 仍被其它程序占用。", opt.Port)
 	}
 
-	if err := os.MkdirAll(Paths.LogDir(), 0o755); err != nil {
+	if err := os.MkdirAll(paths.LogDir(), 0o755); err != nil {
 		return "", fmt.Errorf("创建日志目录失败：%w", err)
 	}
-	tryDelete(Paths.OutLog())
-	tryDelete(Paths.ErrLog())
+	paths.TryDelete(paths.OutLog())
+	paths.TryDelete(paths.ErrLog())
 
-	outFile, err := os.Create(Paths.OutLog())
+	outFile, err := os.Create(paths.OutLog())
 	if err != nil {
 		return "", fmt.Errorf("创建日志文件失败：%w", err)
 	}
@@ -293,7 +261,7 @@ func Start(opt *Options) (string, error) {
 	cmd := exec.Command(node, bin, "web", "--port", fmt.Sprint(opt.Port), "--no-open")
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
-		CreationFlags: createNoWindow,
+		CreationFlags: win32.CreateNoWindow,
 	}
 	cmd.Stdout = writer
 	cmd.Stderr = writer
@@ -347,10 +315,10 @@ waitLoop:
 	}
 
 	if exited && url == "" {
-		o := safeRead(Paths.OutLog())
-		e := safeRead(Paths.ErrLog())
+		o := paths.SafeRead(paths.OutLog())
+		e := paths.SafeRead(paths.ErrLog())
 		return "", fmt.Errorf("dsh web 启动后立即退出（退出码 %d）：%s",
-			exitedCode, trimForMsg(o+"\n"+e, 300))
+			exitedCode, paths.TrimForMsg(o+"\n"+e, 300))
 	}
 	if url == "" {
 		return "", errors.New("等待 dsh web 输出访问地址超时，请查看 logs 目录。")
@@ -358,49 +326,41 @@ waitLoop:
 
 	// 等端口真的起来
 	deadline = time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) && !Paths.IsPortListening(opt.Port) {
+	for time.Now().Before(deadline) && !paths.IsPortListening(opt.Port) {
 		time.Sleep(300 * time.Millisecond)
 	}
 
-	if err := os.WriteFile(Paths.UrlFile(), []byte(url), 0o644); err != nil {
+	if err := os.WriteFile(paths.UrlFile(), []byte(url), 0o644); err != nil {
 		_ = err
 	}
 
 	if !opt.NoBrowser {
-		Paths.OpenUrl(url)
+		paths.OpenURL(url)
 	}
 	return url, nil
 }
 
-// LastUrl 取该端口最近一次的访问地址。
+// LastURL 取该端口最近一次的访问地址。
 //
 // 必须校验端口：last-url.txt 是历史遗留文件，调试时用 -Port 3199 起过实例
 // 就会把 3199 的地址写进去。不校验的话，托盘会打开一个早已失效的端口，
 // 表现为「点开页面却是 3199」。
-func LastUrl(port int) string {
-	if f := Paths.UrlFile(); fileExists(f) {
-		last := strings.TrimSpace(safeRead(f))
-		if p, ok := urlPort(last); ok && p == port {
+func LastURL(port int) string {
+	if f := paths.UrlFile(); paths.FileExists(f) {
+		last := strings.TrimSpace(paths.SafeRead(f))
+		if p, ok := paths.URLPort(last); ok && p == port {
 			return last
 		}
 	}
 
 	// 文件没写或端口不符，从日志里倒序找该端口的最后一个地址
-	if logPath := Paths.OutLog(); fileExists(logPath) {
-		all := urlPattern.FindAllString(safeRead(logPath), -1)
+	if logPath := paths.OutLog(); paths.FileExists(logPath) {
+		all := urlPattern.FindAllString(paths.SafeRead(logPath), -1)
 		for i := len(all) - 1; i >= 0; i-- {
-			if p, ok := urlPort(all[i]); ok && p == port {
+			if p, ok := paths.URLPort(all[i]); ok && p == port {
 				return all[i]
 			}
 		}
 	}
 	return ""
-}
-
-// readFileName 仅用于诊断
-func readFileName(p string) string {
-	if i := strings.LastIndexAny(p, `\/`); i >= 0 {
-		return p[i+1:]
-	}
-	return p
 }

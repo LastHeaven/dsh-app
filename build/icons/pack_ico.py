@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """把 build-icons.ps1 渲染出的 1024px PNG 打包成多尺寸 ICO。
 
-用法：python pack_ico.py <work_dir> <assets_dir>
+用法：python pack_ico.py <work_dir> <tray_dir> <app_dir>
+
+tray_dir 收 running/stopped/busy 三态托盘图标（透明底，go:embed 目标），
+app_dir  收 app.ico（白底圆角卡片，windres 目标）。
 """
 import pathlib
 import struct
@@ -51,13 +54,15 @@ def write_ico(master, sizes, path):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 4:
         print(__doc__)
         return 2
 
     work = pathlib.Path(sys.argv[1])
-    assets = pathlib.Path(sys.argv[2])
-    assets.mkdir(parents=True, exist_ok=True)
+    tray_dir = pathlib.Path(sys.argv[2])
+    app_dir = pathlib.Path(sys.argv[3])
+    tray_dir.mkdir(parents=True, exist_ok=True)
+    app_dir.mkdir(parents=True, exist_ok=True)
 
     for name in ("running", "stopped", "busy", "app"):
         png = work / f"{name}.png"
@@ -67,10 +72,10 @@ def main():
         master = Image.open(png).convert("RGBA").crop((0, 0, 1024, 1024))
 
         if name == "app":
-            out = write_ico(master, APP_SIZES, assets.parent / "app.ico")
+            write_ico(master, APP_SIZES, app_dir / "app.ico")
             print(f"app.ico        {sorted(APP_SIZES)}")
         else:
-            out = write_ico(master, TRAY_SIZES, assets / f"{name}.ico")
+            write_ico(master, TRAY_SIZES, tray_dir / f"{name}.ico")
             print(f"{name}.ico  {sorted(TRAY_SIZES)}")
 
     return 0

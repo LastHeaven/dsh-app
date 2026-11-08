@@ -63,18 +63,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 **代码结构**（详见 ARCHITECTURE）：
 
 ```
-main.go      入口分流 + runHeadless + 更新命令
-win32.go     全部 Win32 绑定
-winhttp.go   WinHTTP（HTTPS）+ 磁盘空间
-semver.go    版本解析与比较
-update.go    更新检测 + 两阶段升级 + 回滚
-paths.go     路径/进程快照/命令行读取
-service.go   Stop/Start/LastUrl/端口归属
-tray.go      托盘窗口与消息循环
-single.go    互斥体 + 命名管道
-console.go   控制台 shim + 参数解析
-icons.go     内嵌 ICO → LoadImageW
+cmd/dsh-web/main.go   入口分流：命令行 → 托盘 / Headless / 更新命令
+internal/win32/       Win32 P/Invoke 绑定（唯一直接调系统 API 的地方）
+internal/config/      共享 Options（最底层，谁都能依赖它）
+internal/paths/       路径、文件工具、node/dsh 定位、开网页开文件夹
+internal/procs/       node 进程快照（带缓存）与命令行读取
+internal/service/     Stop/Start/LastURL/端口归属
+internal/updater/     版本检测、两阶段升级与回滚、JSON、SemVer
+internal/single/      互斥体 + 命名管道单实例转发
+internal/applog/      tray-diag.log / update.log / headless.log
+internal/cli/         控制台输出 + 参数解析 + 帮助
+internal/tray/        通知区图标、消息循环、菜单、看门狗、三态
+build/                构建输入：windres 资源、exe 图标、图标生成脚本
 ```
+
+`internal/win32/` 按 DLL 分文件（kernel/user/menu/icon/notify/net），
+`internal/tray/` 按主题分文件（app/menu/state/actions/update/icons/types）。
+
+**加新功能时注意依赖方向**：`cmd → tray/updater/service/single → procs/paths → win32`，
+不允许反向，也不允许 `service` 依赖 `cli`（`Options` 因此在 `config` 里）。
 
 **几个不能改的约束**：
 
@@ -82,3 +89,5 @@ icons.go     内嵌 ICO → LoadImageW
 - manifest 必须 `requireAdministrator`，资源 id 必须是 1
 - 不能有主窗口，只有托盘（用户明确说过"不需要 UI"）
 - `.ps1` 必须存成 **UTF-8 带 BOM**（否则 PowerShell 5.1 按 GBK 解析报错）
+- `app.syso` 必须落在 `cmd\dsh-web\`（Go 只认被编译包目录里的资源文件）
+- 托盘图标必须留在 `internal\tray\icons\`（`go:embed` 只认包目录内的文件）

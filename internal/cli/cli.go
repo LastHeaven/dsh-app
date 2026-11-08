@@ -1,16 +1,20 @@
 //go:build windows
 
-package main
+// Package cli 是控制台输出与命令行参数解析。
+//
+// 只服务「跑完即退」的运维路径（-Help/-DryRun/-Stop/-CheckUpdate/-Update）
+// 和进程启动时的参数解析；托盘不经过这里。
+package cli
 
 import (
 	"fmt"
 	"os"
 	"strings"
-	"unicode/utf16"
-	"unsafe"
-)
 
-// ------------------------------------------------------------------ 控制台
+	"github.com/LastHeaven/dsh-app/internal/applog"
+	"github.com/LastHeaven/dsh-app/internal/config"
+	"github.com/LastHeaven/dsh-app/internal/win32"
+)
 
 // consoleOut 把中文正确送到父控制台。
 //
@@ -24,24 +28,23 @@ import (
 type consoleOut struct {
 	useWriteConsole bool
 	handle          uintptr
-	logFallback     string // 控制台不可用时的文件兜底
 }
 
 var con = &consoleOut{}
 
-// initConsole 由 main 最先调用，早于任何输出。
-func initConsole() {
+// Init 由 main 最先调用，早于任何输出。
+func Init() {
 	// windowsgui 进程没有自带控制台，附着到父进程（cmd / PowerShell）
-	if getConsoleWindow() == 0 {
-		attachConsole(0xFFFFFFFF) // ATTACH_PARENT_PROCESS = (DWORD)-1
+	if win32.GetConsoleWindow() == 0 {
+		win32.AttachConsole(0xFFFFFFFF) // ATTACH_PARENT_PROCESS = (DWORD)-1
 	}
 
-	h := getStdHandle(stdOutputHandle)
-	if h == 0 || h == invalidHandleValue {
+	h := win32.GetStdHandle(win32.StdOutputHandle)
+	if h == 0 || h == win32.InvalidHandleValue {
 		// 连句柄都没有：退化成只写日志文件
 		return
 	}
-	if getFileType(h) == fileTypeChar && getConsoleWindow() != 0 {
+	if win32.GetFileType(h) == win32.FileTypeChar && win32.GetConsoleWindow() != 0 {
 		// 真控制台：用 WriteConsoleW 输出 UTF-16
 		con.useWriteConsole = true
 		con.handle = h
@@ -49,94 +52,37 @@ func initConsole() {
 }
 
 // Say 打印一行。控制台可能失效（-Stop 从计划任务调用时），所以同时写日志文件。
+func Say(text string) { con.Say(text) }
+
+// Say 打印一行。控制台可能失效（-Stop 从计划任务调用时），所以同时写日志文件。
 func (c *consoleOut) Say(text string) {
 	if c.useWriteConsole && c.handle != 0 {
-		if writeConsole(c.handle, text+"\r\n") {
-			c.log(text)
+		if win32.WriteConsole(c.handle, text+"\r\n") {
+			applog.Headless(text)
 			return
 		}
 		// 写控制台失败就退化成普通写法
 		c.useWriteConsole = false
 	}
 	fmt.Fprintln(os.Stdout, text)
-	c.log(text)
+	applog.Headless(text)
 }
 
-// WriteStdout 处理被重定向的情况：直接 UTF-8 字节流
-func (c *consoleOut) writeRaw(s string) {
-	if c.useWriteConsole && c.handle != 0 {
-		if writeConsole(c.handle, s) {
-			return
-		}
-		c.useWriteConsole = false
-	}
-	_, _ = os.Stdout.WriteString(s)
-}
+// ---------------------------------------------------------------- 参数
 
-func writeConsole(h uintptr, s string) bool {
-	u := utf16.Encode([]rune(s))
-	if len(u) == 0 {
-		return true
-	}
-	var written uint32
-	r, _, _ := procWriteConsoleW.Call(h,
-		uintptr(unsafe.Pointer(&u[0])),
-		uintptr(len(u)),
-		uintptr(unsafe.Pointer(&written)), 0)
-	return r != 0
-}
+// Options 是进程级配置，来自命令行。
+type Options = config.Options
 
-// log 关键信息同时落文件，便于排查（原来 Headless.Say 就是这么做的）
-func (c *consoleOut) log(text string) {
-	if c.logFallback == "" {
-		c.logFallback = Paths.Root()
-	}
-	f, err := os.OpenFile(joinPath(c.logFallback, "headless.log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.WriteString(timestamp() + "  " + text + "\r\n")
-}
-
-func joinPath(dir, name string) string {
-	if dir == "" {
-		return name
-	}
-	if strings.HasSuffix(dir, `\`) || strings.HasSuffix(dir, "/") {
-		return dir + name
-	}
-	return dir + `\` + name
-}
-
-// ------------------------------------------------------------------ 参数
-
-type Options struct {
-	Port         int
-	NoBrowser    bool
-	KeepExisting bool
-	StopOnly     bool
-	DryRun       bool
-	Headless     bool
-	ShowHelp     bool
-
-	// 更新相关
-	CheckUpdate   bool   // -CheckUpdate：查一次最新版就退出
-	UpdateTo      string // -UpdateTo <ver>：升级到指定版本（空表示 latest）
-	NoUpdateCheck bool   // -NoUpdateCheck：托盘不做后台检查
-	Force         bool   // -Force：允许重装同版本（修复损坏的安装）
-}
-
-func parseOptions(args []string) *Options {
-	o := &Options{Port: 3080}
+// ParseOptions 解析命令行参数。
+func ParseOptions(args []string) *Options {
+	o := config.Default()
 	for i := 0; i < len(args); i++ {
 		key := strings.ToLower(strings.TrimLeft(strings.TrimSpace(args[i]), "-/"))
 		switch key {
 		case "port":
 			if i+1 < len(args) {
 				i++
-				if n, ok := atoi(strings.TrimSpace(args[i])); ok {
+				if n, ok := Atoi(strings.TrimSpace(args[i])); ok {
 					o.Port = n
 				}
 			}
@@ -169,7 +115,7 @@ func parseOptions(args []string) *Options {
 			o.ShowHelp = true
 		default:
 			if strings.HasPrefix(key, "port:") {
-				if n, ok := atoi(key[5:]); ok {
+				if n, ok := Atoi(key[5:]); ok {
 					o.Port = n
 				}
 			}
@@ -181,7 +127,8 @@ func parseOptions(args []string) *Options {
 	return o
 }
 
-func atoi(s string) (int, bool) {
+// Atoi 只接受纯数字且限制在端口范围内。
+func Atoi(s string) (int, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, false
@@ -199,8 +146,9 @@ func atoi(s string) (int, bool) {
 	return n, true
 }
 
-func printHelp() {
-	text := `dsh web 托盘版
+// PrintHelp 打印用法。
+func PrintHelp() {
+	con.Say(`dsh web 托盘版
 
   双击 dsh-web.exe          在右下角显示状态图标，并启动 dsh web
   dsh-web.exe -Stop         只关闭该端口上的 dsh web，不启动
@@ -210,12 +158,54 @@ func printHelp() {
   dsh-web.exe -KeepExisting 不关闭已有实例（配合 -Port 调试用）
   dsh-web.exe -Headless     不显示托盘，按命令行跑完就退出（等同原 cmd 行为）
 
+  dsh-web.exe -CheckUpdate  查一次最新版本就退出
+  dsh-web.exe -Update       升级到最新版本（过程中服务会短暂停止）
+  dsh-web.exe -UpdateTo 1.2.3  升级到指定版本
+  dsh-web.exe -Force        允许重装同版本（修复损坏的安装）
+
 托盘菜单：打开管理界面 / 启动 / 停止 / 重启 / 打开访问地址
-         更新到新版本 / 检查更新 / 打开安装目录 / 查看日志 / 退出`
-	con.Say(text)
+          更新到新版本 / 检查更新 / 打开安装目录 / 查看日志 / 退出`)
 }
 
-func timestamp() string {
-	t := timeNow()
-	return fmt.Sprintf("%02d:%02d:%02d", t.Hour(), t.Minute(), t.Second())
+// BoolStr 是给日志用的 True/False。
+func BoolStr(b bool) string {
+	if b {
+		return "True"
+	}
+	return "False"
+}
+
+// Itoa 避免为了转一个整数把 strconv 拉进来。
+func Itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [12]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+
+// JoinComma 拼逗号分隔的列表。
+func JoinComma(parts []string) string {
+	out := ""
+	for i, p := range parts {
+		if i > 0 {
+			out += ", "
+		}
+		out += p
+	}
+	return out
 }

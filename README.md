@@ -83,7 +83,8 @@ git push origin v1.0.1
 
 详见 [docs/TESTING.md](docs/TESTING.md#发版)。
 
-脚本流程：gofmt → windres 生成 `app.syso` → `go vet` → `go build -ldflags "-s -w -H windowsgui"`
+脚本流程：gofmt → windres 生成 `cmd\dsh-web\app.syso` → `go vet` → `go test`
+→ `go build -ldflags "-s -w -H windowsgui"`
 → 校验 manifest 是否嵌入（决定 UAC 提权是否生效）。
 
 > 不要把 `-s -w` 去掉，也别关掉 `-H windowsgui`：前者体积会翻几倍，
@@ -91,15 +92,15 @@ git push origin v1.0.1
 
 ## UAC
 
-`app.manifest` 声明了 `requireAdministrator`：结束旧进程、后台拉起 node
+`build/app.manifest` 声明了 `requireAdministrator`：结束旧进程、后台拉起 node
 都需要管理员权限，所以双击时会正常弹 UAC。这是刻意设计，不是 bug。
 
 ## 图标
 
-`assets\*.ico` 和 `app.ico` 是生成物，由 `icon-src\build-icons.ps1` 产出：
+托盘图标（`internal\tray\icons\*.ico`）和 exe 图标（`build\app.ico`）是生成物，由 `build\icons\build-icons.ps1` 产出：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File icon-src\build-icons.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File build\icons\build-icons.ps1
 ```
 
 ## 目录约定

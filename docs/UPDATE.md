@@ -3,7 +3,7 @@
 托盘版可以检查 dsh 是否有新版本，并一键升级。这份文档讲清楚它怎么工作、
 为什么这么设计、以及哪些地方不能乱改。
 
-代码在 [update.go](../update.go)、[winhttp.go](../winhttp.go)、[semver.go](../semver.go)。
+代码在 [internal/updater/](../internal/updater/)、[internal/win32/net.go](../internal/win32/net.go)。
 
 ## 为什么升级要这么麻烦
 
@@ -232,7 +232,7 @@ rename 后   []      ← 断链
 - registry 地址按 `npm_config_registry` → `~/.npmrc` 的 `registry=` → 官方源
   依次取。用户用 npmmirror 镜像，硬编码官方源会超时
 
-SemVer 比较是自己实现的（[semver.go](../semver.go)），因为当前版本就是预发布版：
+SemVer 比较是自己实现的（[version.go](../internal/updater/version.go)），因为当前版本就是预发布版：
 
 - `0.2.2-alpha.3` < `0.2.2-rc.1` < `0.2.2`
 - `rc.10 > rc.9`（数字段按数值比，**不能按字典序**）
@@ -252,7 +252,7 @@ SemVer 比较是自己实现的（[semver.go](../semver.go)），因为当前版
 `net/http` 会把 http2、DNS resolver、reflect 整条链拉进来，把当初 Go 重写
 省下的体积还回去一半。`winhttp.dll` 是系统组件，走 P/Invoke 只涨 68 KB。
 
-同理，JSON 也是手写的（[update.go](../update.go) 里的 `jsonTopString`）：
+同理，JSON 也是手写的（[json.go](../internal/updater/json.go) 里的 `JSONTopString`）：
 为了从一个 8 KB 的 package.json 里抠一个 `version` 字段而引入 `encoding/json`，
 要多 264 KB，不划算。**注意 `jsonTopString` 只认深度 1 的键** —— package.json
 的 `dependencies` 里也有 `@deepseek-ai/dsh` 这样的同名键，不限制深度会取错。
