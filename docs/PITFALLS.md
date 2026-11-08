@@ -381,6 +381,71 @@ showMenu: TrackPopupMenu 返回 cmd=0     ← ESC 能正常取消
 `cbSize` 不对直接返回 0，模拟 ALT 完全无效 —— 而且**不报任何错误**，
 表现为"改了代码还是打不开"。这个坑实际踩过。
 
+### NOTIFYICONDATA 必须加锁，否则 shell 侧行为未定义
+
+**症状**：右键菜单第一次能弹，之后整个消息循环卡死 ——
+连 ESC、鼠标点击都无法唤醒，只能杀进程。`Responding` 仍显示 True，
+从外部完全看不出卡死。
+
+根因是 `t.nid` 被并发读写：
+
+| 谁 | 做什么 |
+| --- | --- |
+| UI 线程 | `showMenu` 读 Flags；`checkIconAlive` 改 Flags 并调 `NIM_MODIFY` |
+| goroutine | `setIcon` / `setText` / `balloon`（`refreshState`、`startAsync` 等） |
+
+并发修改同一个 `NOTIFYICONDATAW` 会让 `Shell_NotifyIcon` 收到**撕裂的
+结构体**（Size/Flags/Hwnd 互相对不上），shell 侧行为未定义。表现就是
+消息循环彻底卡住。
+
+**修法**：所有触碰 `t.nid` 和调用 `Shell_NotifyIcon` 的地方统一用一把锁。
+
+```go
+var nidMu sync.Mutex
+
+func (t *TrayApp) setIcon(h uintptr) {
+	nidMu.Lock()
+	t.nid.Icon = h
+	t.nid.Flags = nifMessage | nifIcon | nifTip
+	shellNotifyIcon(nimModify, &t.nid)
+	nidMu.Unlock()
+}
+```
+
+覆盖：`setText`、`setIcon`、`balloon`、`checkIconAlive`、`reAddIcon`。
+
+### TrackPopupMenu 之后要补一条 WM_NULL
+
+MSDN 的托盘示例在 `TrackPopupMenu` 返回后都会 `PostMessage(hwnd, WM_NULL, 0, 0)`。
+漏掉的话菜单状态可能残留在 shell 里，下一次右键直接失效。
+
+### uintptr(x) 传负数坐标会溢出
+
+`TrackPopupMenu` 的 x/y 是 `int32`。多显示器时副屏在左侧，x 是负数，
+直接 `uintptr(x)` 会变成 4294967295 之类的巨大正数，菜单弹到屏幕外。
+必须先转 `int64` 再转 `uintptr`。
+
+### 托盘主线程加看门狗，否则卡死无从排查
+
+托盘卡死时用户只能说"右键没反应"，从外部看不出卡在哪。加一个心跳
++看门狗，超过 10 秒没心跳就写日志：
+
+```go
+var uiHeartbeat int64   // wndProc 每次进来 +1
+
+go func() {
+	for {
+		time.Sleep(2 * time.Second)
+		cur := atomic.LoadInt64(&uiHeartbeat)
+		if cur == last { /* 检查停滞时长，超阈值写 diagLog */ }
+		last = cur
+	}
+}()
+```
+
+**注意**：给 `wndProc` 加 `defer` 清空诊断字段是错的 —— 卡死时函数
+根本不返回，defer 不会执行，反而误以为"信息被抹掉了"。
+
 ---
 
 ## 路径与文件

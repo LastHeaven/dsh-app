@@ -506,7 +506,11 @@ func appendMenu(menu uintptr, flags uint32, id uintptr, text string) {
 
 func trackPopupMenu(menu uintptr, flags uint32, x, y int32, hwnd uintptr) uint32 {
 	var rect [4]int32
-	r, _, _ := procTrackPopupMenu.Call(menu, uintptr(flags), uintptr(x), uintptr(y), 0, hwnd,
+	// 坐标是 int32，**必须按有符号值传入**：多显示器时副屏在左侧，
+	// x 会是负数。直接 uintptr(x) 会把它变成 4294967295 之类的巨大正数，
+	// 菜单会弹到屏幕外（或干脆不返回）。先转 int64 再转 uintptr 才安全。
+	r, _, _ := procTrackPopupMenu.Call(menu, uintptr(flags),
+		uintptr(int64(x)), uintptr(int64(y)), 0, hwnd,
 		uintptr(unsafe.Pointer(&rect[0])))
 	return uint32(r)
 }

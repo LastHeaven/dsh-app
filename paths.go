@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"unicode/utf16"
 	"unsafe"
@@ -307,14 +308,22 @@ var (
 )
 
 // 快照缓存：同一进程里反复枚举容易出问题，抓一次存着，需要新鲜的显式失效。
+//
+// **必须加锁**：UI 线程（refreshState→...）和多个 goroutine（Start/Stop/
+// liveWeb）会并发进来。无锁的读-改-写会让 slice 的底层指针或长度处于
+// 撕裂状态，轻则判断错乱，重则调度器/运行时层面出问题。
+// 这是个真实的 data race，不是理论风险。
 var (
+	snapshotMu  sync.Mutex
 	snapshot    []nodeProc
 	snapshotSet bool
 )
 
 func invalidateSnapshot() {
+	snapshotMu.Lock()
 	snapshot = nil
 	snapshotSet = false
+	snapshotMu.Unlock()
 }
 
 // Snapshot 枚举 node.exe 的 pid/父 pid/命令行。
@@ -325,6 +334,9 @@ func invalidateSnapshot() {
 // 也不要退回读 PEB（NtQueryInformationProcess+ReadProcessMemory）——那条
 // 在 node.exe 上返回 ERROR_ACCESS_DENIED(5)，历史上已证明走不通。
 func snapshotProcs() []nodeProc {
+	snapshotMu.Lock()
+	defer snapshotMu.Unlock()
+
 	if snapshotSet {
 		return snapshot
 	}

@@ -5,6 +5,8 @@ package main
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf16"
@@ -135,6 +137,10 @@ func (t *TrayApp) Run() {
 		go t.startAsync()
 	}
 
+	// UI 线程看门狗。托盘卡死时用户只能看到"右键没反应"，
+	// 从外部看不出卡在哪；有心跳日志就能直接定位。
+	t.startWatchdog()
+
 	// 后台更新检查。必须延后启动：启动瞬间正在加载管理界面，
 	// 这会儿发 HTTPS 请求会和首屏抢资源，也容易被误当成启动卡顿。
 	if !t.opt.NoUpdateCheck {
@@ -234,6 +240,8 @@ func (t *TrayApp) reAddIcon(reason string) bool {
 	if t.exiting || t.hwnd == 0 {
 		return false
 	}
+
+	nidMu.Lock()
 	shellNotifyIcon(nimDelete, &t.nid)
 
 	// 重建时把 nid 恢复到"完整状态"：图标 + 提示文字 + 回调消息
@@ -245,6 +253,8 @@ func (t *TrayApp) reAddIcon(reason string) bool {
 	}
 
 	ok := shellNotifyIcon(nimAdd, &t.nid)
+	nidMu.Unlock()
+
 	diagLog("reAddIcon: reason=%s ok=%v hwnd=%d", reason, ok, t.hwnd)
 	if ok {
 		// 真注册上了，把状态刷回去（图标/提示文字）
@@ -266,13 +276,15 @@ func (t *TrayApp) checkIconAlive() {
 	if t.exiting || t.hwnd == 0 {
 		return
 	}
+	nidMu.Lock()
 	f := uint32(nifMessage | nifIcon | nifTip)
 	t.nid.Flags = f
-	if shellNotifyIcon(nimModify, &t.nid) {
+	ok := shellNotifyIcon(nimModify, &t.nid)
+	nidMu.Unlock()
+	if ok {
 		return // 图标还在，一切正常
 	}
 	diagLog("checkIconAlive: NIM_MODIFY 失败，图标已失效，尝试重建")
-	t.nid.Flags = f
 	if !t.reAddIcon("自检发现图标失效") {
 		diagLog("checkIconAlive: 重建后备仍报错，等下一轮（shell 可能还没就绪）")
 	}
@@ -308,6 +320,9 @@ func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	if tray == nil {
 		return defWindowProc(hwnd, msg, wparam, lparam)
 	}
+
+	// 每次进回调先打心跳：看门狗据此判断 UI 线程是否还活着。
+	atomic.AddInt64(&uiHeartbeat, 1)
 
 	switch msg {
 	case wmApp:
@@ -420,9 +435,13 @@ func (t *TrayApp) showMenu() {
 	simulateAltKey()
 	setForegroundWindow(t.hwnd)
 
-	// TPM_RETURNCMD：菜单同步返回被点的项 id（且不再发 WM_COMMAND），
-	// 直接在这里分发，省掉一次消息往返。
+	// MSDN 的托盘示例在 TrackPopupMenu 之后还会补一条 WM_NULL。
+	// 作用是让菜单管理器知道"菜单这一轮结束了"，否则某些情况下
+	// 菜单状态会残留在 shell 里，下一次右键直接失效。
+	// 这条不是可选项，漏掉就会出现"第一次能弹、之后就永远打不开"。
 	cmd := trackPopupMenu(menu, tpmRightButton|tpmReturnCmd|tpmNonotify, pt.X, pt.Y, t.hwnd)
+	postMessage(t.hwnd, wmNull, 0, 0)
+
 	if cmd != 0 {
 		t.dispatchCommand(uint32(cmd))
 	}
@@ -460,15 +479,65 @@ func (t *TrayApp) dispatchCommand(cmd uint32) {
 	}
 }
 
+// ------------------------------------------------------------------ 看门狗
+
+// uiHeartbeat 由 UI 线程定期递增，看门狗 goroutine 检查它是否停滞。
+//
+// **为什么需要它**：托盘主线程一旦卡死，用户看到的就是"右键没反应"，
+// 但进程还活着、图标还在，从外部完全看不出卡在哪。有了心跳+日志，
+// 就能在日志里直接看到"UI 线程从某一刻起不再响应"以及当时它在做什么。
+var uiHeartbeat int64
+
+// startWatchdog 起一个后台 goroutine 监控 UI 线程心跳。
+//
+// 卡死超过 10 秒就把诊断信息写进日志（含最后一次的 phase），
+// 这样用户在反馈"右键打不开"时，日志能直接指出卡在哪一步。
+func (t *TrayApp) startWatchdog() {
+	go func() {
+		last := atomic.LoadInt64(&uiHeartbeat)
+		lastChange := time.Now()
+		for {
+			time.Sleep(2 * time.Second)
+			if t.exiting {
+				return
+			}
+			cur := atomic.LoadInt64(&uiHeartbeat)
+			if cur != last {
+				last = cur
+				lastChange = time.Now()
+				continue
+			}
+			stuck := time.Since(lastChange)
+			if stuck >= 10*time.Second && stuck < 12*time.Second {
+				// 只在刚超过阈值时记一次，避免刷屏
+				diagLog("看门狗: UI 线程已停滞 %d 秒，heartbeat=%d", int(stuck.Seconds()), cur)
+			}
+		}
+	}()
+}
+
 // ------------------------------------------------------------------ 状态
+
+// nidMu 保护 t.nid 和所有 Shell_NotifyIcon 调用。
+//
+// **这是必须的**：t.nid 会被多处并发改动 ——
+//   - UI 线程：showMenu 里读 Flags，checkIconAlive 里改 Flags 并调 NIM_MODIFY
+//   - goroutine：setIcon / setText / balloon（refreshState、startAsync 等）
+//
+// 并发改同一个 NOTIFYICONDATAW 会让 Shell_NotifyIcon 收到撕裂的结构体
+// （Size/Flags/Hwnd 对不上），shell 侧行为未定义 —— 实测表现就是
+// 消息循环彻底卡死、连 ESC 和鼠标点击都无法唤醒。
+var nidMu sync.Mutex
 
 func (t *TrayApp) setText(text string) {
 	if len(text) > 63 {
 		text = truncateBytes(text, 63)
 	}
+	nidMu.Lock()
 	t.nid.Flags = nifMessage | nifIcon | nifTip
 	copyUTF16(t.nid.Tip[:], text)
 	shellNotifyIcon(nimModify, &t.nid)
+	nidMu.Unlock()
 }
 
 // truncateBytes 按字符截断到 n 字节以内，避免把多字节汉字切一半。
@@ -490,18 +559,22 @@ func (t *TrayApp) setIcon(h uintptr) {
 	if h == 0 {
 		return
 	}
+	nidMu.Lock()
 	t.nid.Icon = h
 	t.nid.Flags = nifMessage | nifIcon | nifTip
 	shellNotifyIcon(nimModify, &t.nid)
+	nidMu.Unlock()
 }
 
 func (t *TrayApp) balloon(title, text string, flags uint32) {
+	nidMu.Lock()
 	t.nid.Flags = nifInfo
 	t.nid.InfoFlags = flags
 	copyUTF16(t.nid.InfoTitle[:], title)
 	copyUTF16(t.nid.Info[:], text)
 	shellNotifyIcon(nimModify, &t.nid)
 	t.nid.Flags = nifMessage | nifIcon | nifTip
+	nidMu.Unlock()
 }
 
 // refreshStateAsync 轮询状态（每 3 秒）。
