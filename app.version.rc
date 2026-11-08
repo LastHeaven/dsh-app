@@ -9,11 +9,11 @@
 // 为什么不给 windres 传 -D 覆盖：字符串型的 -D 要带内层引号，
 // 在各种 shell 里的转义规则不一致，实测 PowerShell 下会变成 syntax error。改写文件更可靠。
 
-#define VER_FILEVERSION             1,0,0,0
-#define VER_FILEVERSION_STR         "1.0.0.0"
+#define VER_FILEVERSION             1,0,2,0
+#define VER_FILEVERSION_STR         "1.0.2.0"
 
-#define VER_PRODUCTVERSION          1,0,0,0
-#define VER_PRODUCTVERSION_STR      "1.0.0"
+#define VER_PRODUCTVERSION          1,0,2,0
+#define VER_PRODUCTVERSION_STR      "1.0.2"
 
 1 VERSIONINFO
 FILEVERSION     VER_FILEVERSION

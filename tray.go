@@ -429,8 +429,16 @@ func (t *TrayApp) showMenu() {
 	var pt point
 	getCursorPos(&pt)
 
+	// 前台切换：先发假 ALT 解锁权限，再 SetForegroundWindow。
+	//
+	// 有失败的可能（系统可能仍不认可前台切换），失败时菜单会立刻消失。
+	// 所以做两轮重试：第二轮再来一次假按键 + 置前。
+	// 实测偶发第一轮不生效，重试一次能覆盖绝大多数情况。
 	simulateAltKey()
-	setForegroundWindow(t.hwnd)
+	if !setForegroundWindow(t.hwnd) {
+		simulateAltKey()
+		setForegroundWindow(t.hwnd)
+	}
 
 	menu := createPopupMenu()
 	if menu == 0 {
