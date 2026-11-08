@@ -13,12 +13,16 @@ main()
      ├─ acquireSingleInstance()   互斥体；抢不到就 forwardCommand() 转发后退
      ├─ setProcessDpiAwarenessContext(PerMonitorV2)
      ├─ newTrayApp() → Run()
-     │    ├─ RegisterClassExW + CreateWindowExW(HWND_MESSAGE)  隐藏消息窗口
+     │    ├─ RegisterClassExW + CreateWindowExW(WS_POPUP, 顶层不可见窗口)
+     │    │    └─ **不能用 HWND_MESSAGE**：收不到 TaskbarCreated 广播
      │    ├─ Shell_NotifyIcon(NIM_ADD)
-     │    ├─ SetTimer(poll, 3000ms) → 定期 refreshState()
+     │    ├─ registerWindowMessage("TaskbarCreated") → explorer 重启时重建图标
+     │    ├─ SetTimer(poll, 3000ms) → 状态轮询
+     │    ├─ SetTimer(iconCheck, 10000ms) → 图标健康检查（看 NIM_MODIFY 返回值）
      │    ├─ go updateLoop()      延迟 90s 起，每 6 小时查一次新版本
      │    │    └─ 结果 postMessage(wmUpdateReady) 回窗口线程
      │    └─ GetMessage / DispatchMessage 循环
+     │         └─ 结束后 main 里 os.Exit(0)，不留"无窗口空壳"
      └─ 命令来自两处：菜单(TPM_RETURNCMD) 和 命名管道（第二实例转发）
 ```
 

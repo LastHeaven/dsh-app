@@ -68,6 +68,16 @@ func main() {
 
 	defer cleanupIconTemp()
 	app.Run()
+
+	// Run() 只在消息循环结束时返回。**必须在这里让进程真正退出**：
+	// 后台还有管道监听、更新检查等 goroutine 阻塞着，它们会让进程继续
+	// 存活，形成一个"没有窗口的托盘空壳" —— 通知区图标看着还在，
+	// 但点击送不到窗口，表现就是右键菜单永远打不开。
+	//
+	// 实测过：进程存活、11 个线程、HandleCount 393，但 EnumWindows
+	// 查这个 PID 的顶层窗口数是 0。
+	diagLog("Run() 返回，消息循环已结束，退出进程")
+	os.Exit(0)
 }
 
 // runHeadless 跑完即退的三条路径：DryRun / Stop / 启动。

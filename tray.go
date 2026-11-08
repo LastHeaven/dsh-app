@@ -18,12 +18,20 @@ func timeNow() time.Time { return time.Now() }
 // ------------------------------------------------------------------ 托盘
 
 const (
-	trayTitle     = "dsh web"
-	trayClassName = "DshWebTrayWnd"
-	trayID        = 1
-	timerPoll     = 1
+	trayTitle      = "dsh web"
+	trayClassName  = "DshWebTrayWnd"
+	trayID         = 1
+	timerPoll      = 1
+	timerIconCheck = 2
 
 	pollIntervalMs = 3000
+
+	// 图标健康检查间隔。
+	//
+	// 有了 TaskbarCreated 之后，explorer 重启是即时恢复的，这个定时器只是
+	// 兜底（通知区"隐藏不常用图标"、系统从休眠恢复等场景不会发广播）。
+	// 10 秒是个折中：够快让用户几乎无感，又不会太频繁地打扰 shell。
+	iconCheckIntervalMs = 10000
 )
 
 // 菜单命令 id
@@ -51,6 +59,9 @@ type TrayApp struct {
 	exiting    bool
 	wasRunning bool
 	menuFont   uintptr
+
+	// TaskbarCreated 的消息 id：explorer 启动后会广播，收到就重建图标
+	taskbarCreatedMsg uint32
 
 	// 更新状态。只在这个结构体里存，UI 线程和后台 goroutine
 	// 通过 postMessage(wmUpdateReady) 交接，避免并发读写界面状态。
@@ -83,8 +94,16 @@ func (t *TrayApp) Run() {
 		_ = 0
 	}
 
+	// 窗口用**不可见的普通顶层窗口**，不是 HWND_MESSAGE。
+	//
+	// 为什么不用 HWND_MESSAGE：它是"仅消息窗口"，收不到广播消息，
+	// 而 explorer 重启时发的 TaskbarCreated 正是广播（HWND_BROADCAST）。
+	// 实测确认：用 HWND_MESSAGE 时整条 explorer 重启恢复链路是死的，
+	// 只能靠 30 秒一次的自检兜底，中间那段时间右键是坏的。
+	//
+	// 普通顶层窗口 + WS_POPUP + 不 ShowWindow，用户看不见，但能收到广播。
 	t.hwnd = createWindowEx(0, uintptr(unsafe.Pointer(className)), 0,
-		wsPopup, 0, 0, 0, 0, hwndMessage, 0, instance)
+		wsPopup, 0, 0, 0, 0, 0, 0, instance)
 	if t.hwnd == 0 {
 		messageBox(0, "无法创建托盘窗口：%s", trayTitle, mbOK|mbIconInformation)
 		return
@@ -93,9 +112,23 @@ func (t *TrayApp) Run() {
 	t.addIcon()
 	t.refreshState()
 
+	// explorer 重启（崩溃恢复、开机后重登录）会广播 TaskbarCreated。
+	// 不处理的话图标从此消失、点击也送不到窗口 —— 这是"用久了右键菜单
+	// 打不开"最主要的成因之一。
+	//
+	// **必须注册在创建窗口之后、消息循环之前**：注册只是拿到消息 id，
+	// 顺序其实不敏感，但放在这里更清楚 —— 紧接着就是消息循环。
+	t.taskbarCreatedMsg = registerWindowMessage("TaskbarCreated")
+	diagLog("TaskbarCreated msg id = 0x%X", t.taskbarCreatedMsg)
+
 	// 轮询用 SetTimer，跟着消息循环走，不额外开线程。
 	// **必须在这里设**：hwnd 是 Run() 内部创建的，放到 main 里会拿到 0。
 	procSetTimer.Call(t.hwnd, timerPoll, pollIntervalMs, 0)
+
+	// 图标健康检查用另一个定时器，频率低一些（30 秒）。
+	// 光靠 TaskbarCreated 不够：某些情况下 explorer 不广播、或者图标
+	// 被通知区"隐藏"后丢失，只能靠主动探测发现。
+	procSetTimer.Call(t.hwnd, timerIconCheck, iconCheckIntervalMs, 0)
 
 	// 首次启动：本端口的服务没在跑就拉起来
 	if !Paths.IsPortListening(t.opt.Port) {
@@ -186,12 +219,84 @@ func copyUTF16(dst []uint16, s string) {
 	dst[n] = 0
 }
 
+// reAddIcon 重新注册图标。
+//
+// 用于两种场景：
+//  1. 收到 TaskbarCreated（explorer 重启了，之前的 NIM_ADD 全失效）；
+//  2. 自检发现图标已不在通知区。
+//
+// **先 NIM_DELETE 再 NIM_ADD**：图标还在时直接 ADD 会失败(E_FAIL)。
+//
+// 判定成功与否只看 NIM_ADD 的返回值 —— 不要再用 GetRect 复核：
+// 这台机器上 TrayNotifyWnd 不存在，GetRect 恒失败，会把成功的 ADD
+// 误判成失败（实测踩过，导致每 10 秒重建一次的死循环）。
+func (t *TrayApp) reAddIcon(reason string) bool {
+	if t.exiting || t.hwnd == 0 {
+		return false
+	}
+	shellNotifyIcon(nimDelete, &t.nid)
+
+	// 重建时把 nid 恢复到"完整状态"：图标 + 提示文字 + 回调消息
+	// 缺任何一个，图标会显示但不响应点击。
+	t.nid.Flags = nifMessage | nifIcon | nifTip
+	t.nid.CallbackMessage = wmApp
+	if t.nid.Icon == 0 {
+		t.nid.Icon = t.icons.stopped
+	}
+
+	ok := shellNotifyIcon(nimAdd, &t.nid)
+	diagLog("reAddIcon: reason=%s ok=%v hwnd=%d", reason, ok, t.hwnd)
+	if ok {
+		// 真注册上了，把状态刷回去（图标/提示文字）
+		t.refreshState()
+	}
+	return ok
+}
+
+// checkIconAlive 定时自检图标是否还在。
+//
+// **不能用 Shell_NotifyIconGetRect 判断**：实测这台机器上
+// `FindWindow("TrayNotifyWnd")` 始终返回 0（通知区不是独立顶层窗口），
+// GetRect 因此恒定返回 E_FAIL —— 拿它做判据会导致"每 10 秒误判丢失、
+// 反复重建"的死循环。
+//
+// 改用 NIM_MODIFY 的返回值：图标若已从 shell 注销，MODIFY 会返回 FALSE。
+// 这是唯一不依赖 GetRect、又能真实反映注册状态的信号。
+func (t *TrayApp) checkIconAlive() {
+	if t.exiting || t.hwnd == 0 {
+		return
+	}
+	f := uint32(nifMessage | nifIcon | nifTip)
+	t.nid.Flags = f
+	if shellNotifyIcon(nimModify, &t.nid) {
+		return // 图标还在，一切正常
+	}
+	diagLog("checkIconAlive: NIM_MODIFY 失败，图标已失效，尝试重建")
+	t.nid.Flags = f
+	if !t.reAddIcon("自检发现图标失效") {
+		diagLog("checkIconAlive: 重建后备仍报错，等下一轮（shell 可能还没就绪）")
+	}
+}
+
 func (t *TrayApp) messageLoop() {
 	var msg msgStruct
 	for {
 		r := getMessage(&msg, 0, 0, 0)
-		if r == 0 || r == -1 {
-			break
+		if r == 0 {
+			// 正常的 WM_QUIT：窗口已销毁，可以退出
+			diagLog("messageLoop: WM_QUIT")
+			return
+		}
+		if r == -1 {
+			// **这是个真实踩到的坑**：getMessage 返回 -1 表示出错（不是退出）。
+			// 原实现直接 break 出循环，于是 Run() 返回、main 返回，但进程里
+			// 还有其他 goroutine（管道监听、更新检查）让它继续活着 ——
+			// 结果就是一个"窗口没了、进程还在"的空壳：通知区图标看着还在，
+			// 但点击事件送不到窗口，右键菜单永远打不开。
+			//
+			// 现在明确记日志，并且让整个进程退出，避免留下空壳。
+			diagLog("messageLoop: GetMessage 返回 -1（错误），退出进程以免留下无窗口的托盘空壳")
+			return
 		}
 		translateMessage(&msg)
 		dispatchMessage(&msg)
@@ -215,7 +320,14 @@ func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		return 0
 
 	case wmTimer:
-		go tray.refreshStateAsync()
+		// **必须按 wparam 区分定时器 id**：两个定时器共用 WM_TIMER，
+		// 不区分的话图标自检会以 3 秒一次的频率跑，白白多调 API。
+		switch wparam {
+		case timerIconCheck:
+			tray.checkIconAlive()
+		default:
+			go tray.refreshStateAsync()
+		}
 		return 0
 
 	case wmUpdateReady:
@@ -237,6 +349,14 @@ func wndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		postQuitMessage(0)
 		return 0
 	}
+
+	// TaskbarCreated 不是固定常量，只能运行时比较注册出来的 id。
+	// 放在 switch 后面：它的值可能和上面任何一个常量撞上，必须先判完。
+	if tray.taskbarCreatedMsg != 0 && msg == tray.taskbarCreatedMsg {
+		tray.reAddIcon("explorer 重启（TaskbarCreated）")
+		return 0
+	}
+
 	return defWindowProc(hwnd, msg, wparam, lparam)
 }
 

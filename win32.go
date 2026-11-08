@@ -56,6 +56,7 @@ var (
 
 	// user32
 	procRegisterClassExW      = moduser32.NewProc("RegisterClassExW")
+	procRegisterWindowMessage = moduser32.NewProc("RegisterWindowMessageW")
 	procCreateWindowExW       = moduser32.NewProc("CreateWindowExW")
 	procDefWindowProcW        = moduser32.NewProc("DefWindowProcW")
 	procDestroyWindow         = moduser32.NewProc("DestroyWindow")
@@ -87,8 +88,9 @@ var (
 	procGetDeviceCaps = modgdi32.NewProc("GetDeviceCaps")
 
 	// shell32
-	procShellNotifyIconW = modshell32.NewProc("Shell_NotifyIconW")
-	procShellExecuteW    = modshell32.NewProc("ShellExecuteW")
+	procShellNotifyIconW     = modshell32.NewProc("Shell_NotifyIconW")
+	procShellNotifyIconGetRt = modshell32.NewProc("Shell_NotifyIconGetRect")
+	procShellExecuteW        = modshell32.NewProc("ShellExecuteW")
 
 	// ntdll：命令行不走 WMI（AOT/原生下 System.Management 不可用，且这里本就没 .NET）
 	procNtQueryInformationProcess = modntdll.NewProc("NtQueryInformationProcess")
@@ -434,6 +436,20 @@ func getTickCount64() uint64 {
 func registerClassEx(wc *wndClassEx) uint16 {
 	r, _, _ := procRegisterClassExW.Call(uintptr(unsafe.Pointer(wc)))
 	return uint16(r)
+}
+
+// registerWindowMessage 注册/查询系统级消息 id。
+//
+// 用来拿 "TaskbarCreated" —— explorer 每次启动（含崩溃重启、开机后重新登录）
+// 都会广播这条消息。托盘程序收到后必须重新 Shell_NotifyIcon(NIM_ADD)，
+// 否则图标在通知区消失，用户点不到也就右键不出菜单。
+func registerWindowMessage(name string) uint32 {
+	p := utf16Ptr(name)
+	if p == nil {
+		return 0
+	}
+	r, _, _ := procRegisterWindowMessage.Call(uintptr(unsafe.Pointer(p)))
+	return uint32(r)
 }
 
 func createWindowEx(exStyle uint32, class, title uintptr, style uint32,

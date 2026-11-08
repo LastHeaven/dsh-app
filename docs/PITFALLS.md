@@ -278,6 +278,71 @@ imported from D:\npm\node_modules\@deepseek-ai\dsh\lib\bin.js
 `npm ls -g` 里出现两个 dsh，后续操作都会被污染。
 所以备份/损坏副本一律放 `<prefix>\.dsh-web-old`、`<prefix>\.dsh-web-broken`。
 
+### 消息循环退出后必须让进程真的退出
+
+**症状**：托盘用久了，右键点不出菜单。进程还在，但没有任何窗口。
+
+实测过一次：PID 活着、11 个线程、HandleCount 393，而 `EnumWindows`
+查这个 PID 的顶层窗口数是 **0**。
+
+根因是 `getMessage()` 返回 `-1`（出错，不是退出）时，原实现直接 `break`
+出循环。`Run()` 返回、`main` 返回，但进程里还有阻塞着的 goroutine
+（管道监听、更新检查），Go 不会因此退出 —— 留下一个"没有窗口的托盘空壳"。
+通知区图标看着还在，点击却送不到窗口。
+
+规则：
+
+1. `getMessage` 返回 `0` 是正常退出，返回 `-1` 必须**记日志并让进程退出**；
+2. `main` 里 `app.Run()` 返回后要显式 `os.Exit(0)`，不能依赖"函数返回就结束"。
+
+### 托盘窗口不能用 HWND_MESSAGE，否则收不到 TaskbarCreated
+
+**第二条"右键菜单打不开"的成因**：explorer 重启（崩溃恢复、开机后重登录）
+会让所有 `NIM_ADD` 的图标失效。标准做法是监听 `TaskbarCreated` 广播然后重建。
+
+但 `TaskbarCreated` 是**广播消息**，`HWND_MESSAGE`（仅消息窗口）收不到。
+实测确认：用 HWND_MESSAGE 时整条恢复链路是死的。
+
+**改成普通顶层窗口**：`CreateWindowExW(..., WS_POPUP, ..., parent=0, ...)`，
+不调 `ShowWindow`，用户看不见，但能收广播。
+
+```go
+t.taskbarCreatedMsg = registerWindowMessage("TaskbarCreated")
+// wndProc 里：switch 判完固定常量后，再比较这个动态 id
+if tray.taskbarCreatedMsg != 0 && msg == tray.taskbarCreatedMsg {
+    tray.reAddIcon("explorer 重启（TaskbarCreated）")
+    return 0
+}
+```
+
+实测效果：explorer 被杀后 **4 秒内**自动重建图标。
+
+### 别用 Shell_NotifyIconGetRect 判断图标是否可见
+
+想用它做健康检查会很坑：这台机器上 `FindWindow("TrayNotifyWnd")`
+**始终返回 0**（通知区不是独立顶层窗口），于是 `GetRect` 恒定返回
+`E_FAIL (0x80004005)`。
+
+拿它做判据的后果是：每 10 秒误判"图标丢失"→ 重建 → 再误判，
+形成无限重建循环，日志疯狂刷。
+
+**正确判据**：看 `NIM_MODIFY` 的返回值。图标若已被 shell 注销，
+MODIFY 返回 FALSE；这是唯一不依赖 GetRect、又能反映真实注册状态的信号。
+
+```go
+t.nid.Flags = nifMessage | nifIcon | nifTip
+if shellNotifyIcon(nimModify, &t.nid) {
+    return // 还活着
+}
+```
+
+### 重建图标时要把 nid 恢复完整
+
+`NIM_ADD` 时 `Flags` 必须是完整的 `nifMessage | nifIcon | nifTip`，
+并且 `CallbackMessage` 要对。少任何一项，图标会显示但**不响应点击**。
+
+另外 `NIM_ADD` 之前先 `NIM_DELETE`：图标还在时直接 ADD 会返回 E_FAIL。
+
 ---
 
 ## 路径与文件
